@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# chaff outputs
+out/
+reports/
+*.report.json
+*.report.md
+*.profile.jsonl
+
+# Local-only context documents. These are working notes for the author and are
+# deliberately NOT published. data/samples/README.md is public and stays tracked.
+/CORE_PROBLEM.md
+/OBJECTIVE.md
+/PROJECT.md
+/MEMORY.md
+
+# graphify — local-only. The graph embeds content extracted from the context
+# documents above (54 of 264 nodes carry their rationale text), so publishing it
+# would republish them by the back door.
+graphify-out/
+
+# corpora — never commit crawl dumps
+data/corpora/
+data/raw/
+*.jsonl.gz
+!data/samples/*.jsonl
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

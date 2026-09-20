@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chaff"
+version = "0.1.0"
+description = "Synthetic corpus contamination and token entropy auditing for LLM pre-training data"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Aryan Yadav" }]
+requires-python = ">=3.9"
+keywords = ["llm", "pretraining", "data-quality", "entropy", "model-collapse", "corpus"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.9",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Deliberately zero runtime dependencies: chaff runs on a stock interpreter so it
+# can be dropped onto a data node next to a crawl dump without a build step.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+chaff = "chaff.cli:main"
+
+[project.urls]
+Repository = "https://github.com/Ark07Yad/synthetic-corpus-audit"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
