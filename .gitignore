@@ -24,6 +24,7 @@ reports/
 /OBJECTIVE.md
 /PROJECT.md
 /MEMORY.md
+/ARCHITECTURE.md
 
 # graphify — local-only. The graph embeds content extracted from the context
 # documents above (54 of 264 nodes carry their rationale text), so publishing it
