@@ -6,8 +6,9 @@ Find AI-generated text in a pre-training corpus *before* it poisons your tokeniz
 
 [![ci](https://github.com/Ark07Yad/synthetic-corpus-audit/actions/workflows/ci.yml/badge.svg)](https://github.com/Ark07Yad/synthetic-corpus-audit/actions/workflows/ci.yml)
 ![python](https://img.shields.io/badge/python-3.9%2B-blue)
+![tests](https://img.shields.io/badge/tests-66-brightgreen)
 ![dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)
-![status](https://img.shields.io/badge/status-phase%201%20of%206-orange)
+![status](https://img.shields.io/badge/status-phase%202%20of%206-orange)
 
 ---
 
@@ -73,7 +74,7 @@ human writing out of the results.
 
 | Family | Signals | Phase |
 |---|---|---|
-| **distributional** | Zipf head/tail slope, Heaps' β, conditional bigram entropy, hapax ratio, MTLD, Yule's K, n-gram repetition, compressibility | 2 |
+| **distributional** | Zipf slope, frequency-spectrum slope, Heaps' β, branching entropy, hapax ratio, MTLD, Yule's K, 4/8-gram repetition, zlib compressibility | **2 — done** |
 | **surprisal** | mean surprisal, **variance and burstiness**, low-surprisal run length | 3 |
 | **artifact** | system-prompt echoes, hedging scaffolds, markdown watermarks, overused lexicon, *absence* of human error | 4 |
 | **reasoning** | reasoning-step **state gain**, restatement ratio, loop detection | 4 |
@@ -93,14 +94,22 @@ the whole tool dependency-free.
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Foundation: tokenization, streaming corpus I/O, metric contract, CLI, sample corpus, CI | **done** |
-| 2 | Distributional family | next |
-| 3 | Surprisal family + corpus-internal LM | planned |
+| 2 | Distributional family — 3 extractors, up to 9 signals per document | **done** |
+| 3 | Surprisal family + corpus-internal LM | next |
 | 4 | Artifact + reasoning families | planned |
 | 5 | Robust score fusion, tiers, MD/JSON/HTML reports | planned |
 | 6 | Calibration on a labelled corpus, published precision/recall, graphify graph | planned |
 
-Phase 1 ships working corpus profiling. It does **not** yet score contamination —
-`chaff families` will tell you so rather than pretending otherwise.
+Phase 2 computes and emits distributional signals per document. It does **not** yet
+fuse them into a contamination score — that is phase 5, and `chaff families` will tell
+you so rather than pretending otherwise.
+
+Signals are implemented and unit-tested against controlled corpora with known
+properties (Zipfian distributions at known exponents, artificially truncated tails).
+They are **not yet calibrated against real labelled data** — the 10-document sample
+corpus averages 150 words, which is below the length at which most of these metrics
+carry information. Building a long-document evaluation corpus is phase 6, and no
+accuracy claim will be made before then.
 
 ## Limitations, stated up front
 
@@ -114,6 +123,10 @@ Phase 1 ships working corpus profiling. It does **not** yet score contamination 
 - **Not for academic integrity.** Wrong granularity, and the false-positive cost falls on
   a person rather than on a row in a dataset. Please do not use it that way.
 - Single-document scores are noisy below ~50 words and are reported, not scored.
+- **Signals withhold themselves rather than guess.** Several metrics need a minimum
+  document length to mean anything — the frequency-spectrum slope needs ~2,000 words,
+  measured rather than assumed — and return nothing below it. A short document will
+  legitimately produce fewer signals than a long one.
 
 ## Repository map
 

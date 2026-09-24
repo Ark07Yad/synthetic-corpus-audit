@@ -124,5 +124,33 @@ def extract_signals(
 
 
 def clear_registry() -> None:
-    """Drop all registrations. Test-support only."""
+    """Drop all registrations. Test-support only.
+
+    Extractors register at import time, and a module is only imported once per
+    process, so a bare clear is **not** recoverable by re-importing. Tests that clear
+    the registry must restore it — see :func:`registry_snapshot` and
+    :func:`restore_registry` — or every later test in the session runs against an
+    empty registry and silently passes for the wrong reason.
+    """
     _REGISTRY.clear()
+
+
+def registry_snapshot() -> "Dict[str, Tuple[str, Extractor]]":
+    """A copy of the current registrations. Test-support only."""
+    return dict(_REGISTRY)
+
+
+def restore_registry(snapshot: "Dict[str, Tuple[str, Extractor]]") -> None:
+    """Replace the registry with ``snapshot``. Test-support only."""
+    _REGISTRY.clear()
+    _REGISTRY.update(snapshot)
+
+
+# Importing the metric modules is what registers their extractors. Discovery is
+# explicit and greppable by design (see ARCHITECTURE.md section 8): there is no plugin
+# scanning, so which metrics ran is always answerable by reading this list. The import
+# sits at the bottom because each module imports ``Signal`` and ``register`` from this
+# one, which must therefore already be defined.
+from . import entropy as _entropy  # noqa: E402,F401
+from . import ngram as _ngram      # noqa: E402,F401
+from . import zipf as _zipf        # noqa: E402,F401

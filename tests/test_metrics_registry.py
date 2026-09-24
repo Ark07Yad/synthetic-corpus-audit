@@ -13,15 +13,24 @@ from chaff.metrics import (
     extract_signals,
     register,
     registered,
+    registry_snapshot,
+    restore_registry,
 )
 from chaff.tokenization import build_view
 
 
 @pytest.fixture(autouse=True)
 def clean_registry():
+    """Isolate each test on an empty registry, then put the real one back.
+
+    Restoring matters: extractors register at import time and modules import once per
+    process, so a test that merely cleared the registry would leave every later test
+    in the session running against nothing.
+    """
+    saved = registry_snapshot()
     clear_registry()
     yield
-    clear_registry()
+    restore_registry(saved)
 
 
 def _doc(text="word " * 80):

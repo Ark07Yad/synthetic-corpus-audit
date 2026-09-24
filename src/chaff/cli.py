@@ -26,7 +26,7 @@ from .tokenization import build_view
 #: Roadmap shown by ``chaff families``. Kept beside the registry so the CLI can
 #: report honestly on what is implemented versus planned.
 PHASE_PLAN = {
-    "distributional": ("phase 2", "entropy, Zipf tail, Heaps' law, MTLD, n-gram repetition"),
+    "distributional": ("phase 2", "entropy, Zipf slope, frequency spectrum, Heaps' law, MTLD, n-gram repetition"),
     "surprisal": ("phase 3", "corpus-internal LM perplexity mean/variance/burstiness"),
     "artifact": ("phase 4", "formatting watermarks, hedging, system-prompt echoes"),
     "reasoning": ("phase 4", "redundant reasoning-step loops, state-gain analysis"),
@@ -165,7 +165,9 @@ def cmd_families(_args: argparse.Namespace) -> int:
     for family in FAMILIES:
         phase, blurb = PHASE_PLAN[family]
         names = active.get(family, [])
-        status = "{0} signals".format(len(names)) if names else "not yet implemented"
+        # Extractors, not signals: one extractor emits several related signals when
+        # they share a computation (lexical_profile emits six from one word count).
+        status = "{0} extractors".format(len(names)) if names else "not yet implemented"
         print("  {0:<16} {1:<9} {2:<20} {3}".format(family, phase, status, blurb))
         for name in sorted(names):
             print("      - {0}".format(name))
