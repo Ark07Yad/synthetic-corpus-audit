@@ -89,7 +89,7 @@ That family is built on a **corpus-internal n-gram language model** with leave-o
 counts, not a downloaded transformer. It costs one extra pass over the data and keeps
 the whole tool dependency-free.
 
-## Status: phase 1 of 6
+## Status: phase 2 of 6
 
 | Phase | Scope | State |
 |---|---|---|
@@ -134,7 +134,7 @@ accuracy claim will be made before then.
 |---|---|
 | `src/chaff/` | The package |
 | `src/chaff/metrics/` | The `Signal` contract and the metric families |
-| `tests/` | 41 tests |
+| `tests/` | 66 tests |
 | [`data/samples/`](data/samples/) | 10 labelled documents, including deliberate hard cases |
 
 ## Licence
