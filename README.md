@@ -6,9 +6,9 @@ Find AI-generated text in a pre-training corpus *before* it poisons your tokeniz
 
 [![ci](https://github.com/Ark07Yad/synthetic-corpus-audit/actions/workflows/ci.yml/badge.svg)](https://github.com/Ark07Yad/synthetic-corpus-audit/actions/workflows/ci.yml)
 ![python](https://img.shields.io/badge/python-3.9%2B-blue)
-![tests](https://img.shields.io/badge/tests-66-brightgreen)
+![tests](https://img.shields.io/badge/tests-108-brightgreen)
 ![dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)
-![status](https://img.shields.io/badge/status-phase%202%20of%206-orange)
+![status](https://img.shields.io/badge/status-phase%203%20of%206-orange)
 
 ---
 
@@ -59,8 +59,14 @@ droppable onto the data node that already holds your dump. CI enforces this.
 chaff profile corpus.jsonl.gz              # corpus shape and signal summary
 chaff profile corpus.jsonl --out rows.jsonl  # per-document rows, joins back on doc_id
 chaff inspect corpus.jsonl -n 5            # see individual docs as chaff sees them
+chaff profile crawl.jsonl --reference wiki.jsonl  # score against a trusted corpus instead
 chaff families                             # what is implemented, and what is coming
 ```
+
+The surprisal family reads the corpus **twice**: once to build a language model, once to
+score. Everything else needs one pass, and chaff only makes the second pass when a family
+that needs it is active. Input from stdin can't be read twice, so the surprisal family
+is skipped there, with a note saying so, unless `--reference` supplies the model.
 
 Reads `.jsonl`, `.jsonl.gz`, `.ndjson`, plain text files, directories, or stdin.
 The text field is autodetected across Common Crawl / C4 / RedPajama / Pile conventions,
@@ -75,41 +81,63 @@ human writing out of the results.
 | Family | Signals | Phase |
 |---|---|---|
 | **distributional** | Zipf slope, frequency-spectrum slope, Heaps' β, branching entropy, hapax ratio, MTLD, Yule's K, 4/8-gram repetition, zlib compressibility | **2 — done** |
-| **surprisal** | mean surprisal, **variance and burstiness**, low-surprisal run length | 3 |
+| **surprisal** | mean surprisal, surprisal spread at word and sentence scale (gated on model adequacy), recycled-span runs | **3 — done** |
 | **artifact** | system-prompt echoes, hedging scaffolds, markdown watermarks, overused lexicon, *absence* of human error | 4 |
 | **reasoning** | reasoning-step **state gain**, restatement ratio, loop detection | 4 |
 
-The most load-bearing idea is in the surprisal family: human text is **bursty** — a
-predictable stretch, then a surprising word, then another predictable stretch. Decoded
-text is flat. Measuring the *variance* of surprisal separates them far better than
-measuring its mean, which is the mistake that makes naive perplexity filters delete
-human writing and keep the synthetic text.
+### The surprisal family, and a thesis this project had to correct
 
-That family is built on a **corpus-internal n-gram language model** with leave-one-doc-out
-counts, not a downloaded transformer. It costs one extra pass over the data and keeps
-the whole tool dependency-free.
+The surprisal family is built on a **corpus-internal trigram language model**, not a
+downloaded transformer. Every document is scored against the corpus *minus itself*, by
+subtracting its own counts at query time. The tests assert that this gives exactly the
+scores of a model retrained without the document, to the last bit. It costs one extra
+pass and keeps the tool dependency-free. Most of the model's entries occur exactly once,
+and under leave-one-out those are provably dead weight, so they're pruned **without
+changing a single score**: 74% of entries on Zipfian text.
 
-## Status: phase 2 of 6
+This project started from a popular claim: human text is *bursty*, so the **spread** of
+surprisal should separate it from generated text better than the **mean** does. That was
+tested on controlled corpora (one random language; "human" documents sampled from its
+full distribution, "synthetic" ones through top-p truncation) and it turned out to be
+wrong in a specific way:
+
+- **The mean is the robust signal.** It separated the two at every model quality tested,
+  with AUC 0.83 at the worst and 1.00 at the best.
+- **Spread only works on a well-estimated model**, and below that it doesn't just weaken,
+  it **inverts** (AUC 0.20–0.38), because backoff noise dominates the spread of *both*
+  classes. So chaff measures its own model's adequacy (bigram coverage) and only emits
+  spread signals above thresholds read off that experiment. `chaff profile` reports which
+  side of the line your corpus is on.
+
+The toy language has no topic structure, so this doesn't settle whether *real* human text
+is bursty because of topic shifts. That's a phase 6 measurement on real data, not
+something assumed here.
+
+## Status: phase 3 of 6
 
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Foundation: tokenization, streaming corpus I/O, metric contract, CLI, sample corpus, CI | **done** |
 | 2 | Distributional family — 3 extractors, up to 9 signals per document | **done** |
-| 3 | Surprisal family + corpus-internal LM | next |
-| 4 | Artifact + reasoning families | planned |
+| 3 | Surprisal family — two-pass pipeline, leave-one-out trigram LM, coverage-gated signals | **done** |
+| 4 | Artifact + reasoning families | next |
 | 5 | Robust score fusion, tiers, MD/JSON/HTML reports | planned |
 | 6 | Calibration on a labelled corpus, published precision/recall, graphify graph | planned |
 
-Phase 2 computes and emits distributional signals per document. It does **not** yet
-fuse them into a contamination score — that is phase 5, and `chaff families` will tell
-you so rather than pretending otherwise.
+chaff computes and emits distributional and surprisal signals per document. It does
+**not** yet fuse them into a contamination score. That's phase 5, and `chaff families`
+will tell you so rather than pretending otherwise.
 
 Signals are implemented and unit-tested against controlled corpora with known
-properties (Zipfian distributions at known exponents, artificially truncated tails).
-They are **not yet calibrated against real labelled data** — the 10-document sample
-corpus averages 150 words, which is below the length at which most of these metrics
-carry information. Building a long-document evaluation corpus is phase 6, and no
-accuracy claim will be made before then.
+properties: Zipfian distributions at known exponents, artificially truncated tails,
+nucleus-truncated sampling from a known language. They are **not yet calibrated against
+real labelled data**. The 10-document sample corpus averages 150 words, which is below
+the length at which most of these metrics carry information, and at 1,475 tokens it's
+far too small to train a language model. Building a long-document evaluation corpus is
+phase 6, and no accuracy claim will be made before then.
+
+Throughput, single-threaded pure Python: ~620k tokens/s building the model, ~170k
+tokens/s for the scoring pass with every family active.
 
 ## Limitations, stated up front
 
@@ -123,6 +151,11 @@ accuracy claim will be made before then.
 - **Not for academic integrity.** Wrong granularity, and the false-positive cost falls on
   a person rather than on a row in a dataset. Please do not use it that way.
 - Single-document scores are noisy below ~50 words and are reported, not scored.
+- **Corpus-relative surprisal measures typicality within your corpus.** Boilerplate only
+  looks predictable if the corpus contains lots of similar boilerplate. That's usually
+  true of a web crawl full of contracts and cookie banners, and it's exactly where the
+  templated-human false positive is expected. `--reference` with a trusted corpus is the
+  better setting when one exists.
 - **Signals withhold themselves rather than guess.** Several metrics need a minimum
   document length to mean anything — the frequency-spectrum slope needs ~2,000 words,
   measured rather than assumed — and return nothing below it. A short document will
@@ -134,7 +167,7 @@ accuracy claim will be made before then.
 |---|---|
 | `src/chaff/` | The package |
 | `src/chaff/metrics/` | The `Signal` contract and the metric families |
-| `tests/` | 66 tests |
+| `tests/` | 108 tests |
 | [`data/samples/`](data/samples/) | 10 labelled documents, including deliberate hard cases |
 
 ## Licence

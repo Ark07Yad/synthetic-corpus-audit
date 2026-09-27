@@ -5,13 +5,18 @@ from __future__ import annotations
 import pytest
 
 from chaff.document import Document
+from chaff.context import SOURCE_SELF, CorpusContext
 from chaff.metrics import (
     FAMILY_ARTIFACT,
     FAMILY_DISTRIBUTIONAL,
+    FAMILY_SURPRISAL,
     Signal,
+    bind_contextual,
     clear_registry,
+    contextual_registered,
     extract_signals,
     register,
+    register_contextual,
     registered,
     registry_snapshot,
     restore_registry,
@@ -90,3 +95,38 @@ def test_registered_listing_is_sorted():
     for name in ("zeta", "alpha", "mid"):
         register(name, FAMILY_DISTRIBUTIONAL)(lambda doc, view: [])
     assert [n for n, _ in registered()] == ["alpha", "mid", "zeta"]
+
+
+def test_names_are_unique_across_plain_and_contextual_extractors():
+    register("shared_name", FAMILY_DISTRIBUTIONAL)(lambda doc, view: [])
+    with pytest.raises(ValueError):
+        register_contextual("shared_name", FAMILY_SURPRISAL)(lambda ctx: None)
+
+
+def test_contextual_extractors_run_only_once_bound():
+    @register_contextual("ctx_metric", FAMILY_SURPRISAL)
+    def _factory(context):
+        n = context.n_documents
+        return lambda doc, view: [Signal("ctx_metric", float(n), FAMILY_SURPRISAL, -1)]
+
+    doc = _doc()
+    view = build_view(doc.text)
+    assert extract_signals(doc, view) == []
+    bound = bind_contextual(CorpusContext(source=SOURCE_SELF, n_documents=7))
+    assert [s.value for s in extract_signals(doc, view, bound=bound)] == [7.0]
+    assert registered() == [("ctx_metric", FAMILY_SURPRISAL)]
+    assert contextual_registered() == [("ctx_metric", FAMILY_SURPRISAL)]
+
+
+def test_a_factory_may_decline_to_bind():
+    register_contextual("needs_lm", FAMILY_SURPRISAL)(lambda ctx: None)
+    assert bind_contextual(CorpusContext(source=SOURCE_SELF, n_documents=1)) == []
+
+
+def test_snapshot_restores_both_tables():
+    register_contextual("kept", FAMILY_SURPRISAL)(lambda ctx: None)
+    saved = registry_snapshot()
+    clear_registry()
+    assert contextual_registered() == []
+    restore_registry(saved)
+    assert contextual_registered() == [("kept", FAMILY_SURPRISAL)]

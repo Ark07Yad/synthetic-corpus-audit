@@ -18,16 +18,19 @@ import sys
 from typing import List, Optional, Sequence
 
 from . import __version__
+from .context import SOURCE_REFERENCE
 from .corpus_io import CorpusError, iter_documents, write_jsonl
-from .metrics import FAMILIES, registered
-from .pipeline import profile_corpus, profile_document, short_document_note
+from .lm import StreamMismatchError
+from .metrics import FAMILIES, bind_contextual, contextual_registered, registered
+from .metrics.surprisal import MIN_COVERAGE_SENTENCE_SPREAD, MIN_COVERAGE_TOKEN_SPREAD
+from .pipeline import build_context, profile_corpus, profile_document, short_document_note
 from .tokenization import build_view
 
 #: Roadmap shown by ``chaff families``. Kept beside the registry so the CLI can
 #: report honestly on what is implemented versus planned.
 PHASE_PLAN = {
     "distributional": ("phase 2", "entropy, Zipf slope, frequency spectrum, Heaps' law, MTLD, n-gram repetition"),
-    "surprisal": ("phase 3", "corpus-internal LM perplexity mean/variance/burstiness"),
+    "surprisal": ("phase 3", "corpus-internal LM: mean surprisal, coverage-gated spread, recycled spans"),
     "artifact": ("phase 4", "formatting watermarks, hedging, system-prompt echoes"),
     "reasoning": ("phase 4", "redundant reasoning-step loops, state-gain analysis"),
 }
@@ -51,6 +54,9 @@ def _build_parser() -> argparse.ArgumentParser:
     common.add_argument("--limit", type=int, default=None, help="stop after N documents")
     common.add_argument("--min-chars", type=int, default=0,
                         help="skip documents shorter than N characters")
+    common.add_argument("--reference", default=None, metavar="CORPUS",
+                        help="build the language model from this trusted corpus instead of "
+                             "the audited one (also skips the audited corpus's extra pass)")
 
     p_profile = sub.add_parser("profile", parents=[common],
                                help="profile corpus shape and registered signals")
@@ -85,6 +91,7 @@ def cmd_profile(args: argparse.Namespace) -> int:
         min_chars=args.min_chars,
         families=args.family,
         on_row=(lambda row: collector(row.to_row())) if collector else None,
+        reference=args.reference,
     )
 
     if profile.n_documents == 0:
@@ -113,11 +120,16 @@ def cmd_profile(args: argparse.Namespace) -> int:
         _fmt_int(summary["p95"]), _fmt_int(summary["max"])))
     print("elapsed         {0:.2f}s".format(profile.elapsed_seconds))
 
+    if profile.lm_summary:
+        _print_lm(profile.lm_summary, profile.context_source)
+
     if profile.metrics_active:
         print("\nsignals active  {0}".format(", ".join(profile.metrics_active)))
     else:
-        print("\nsignals active  none — metric families land in phases 2-4 "
-              "(run 'chaff families')")
+        print("\nsignals active  none — run 'chaff families'")
+
+    for note in profile.notes:
+        print("\nnote: {0}".format(note))
 
     note = short_document_note(profile)
     if note:
@@ -125,14 +137,51 @@ def cmd_profile(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_lm(summary: dict, source: Optional[str]) -> None:
+    """Report language-model adequacy, since it decides which surprisal signals exist."""
+    coverage = summary.get("bigram_coverage", 0.0)
+    if source == SOURCE_REFERENCE:
+        how = "reference corpus"
+    else:
+        how = "this corpus, leave-one-document-out"
+    print("language model  {0}-gram from {1}; {2} tokens, {3} types".format(
+        summary["order"], how, _fmt_int(summary["tokens"]), _fmt_int(summary["vocabulary"])))
+    print("                {0} entries after lossless pruning ({1:.0%} removed)".format(
+        _fmt_int(summary["entries"]), summary["pruned_share"]))
+    if coverage >= MIN_COVERAGE_SENTENCE_SPREAD:
+        verdict = "all surprisal signals active"
+    elif coverage >= MIN_COVERAGE_TOKEN_SPREAD:
+        verdict = "sentence-level spread withheld (needs {0:.2f})".format(MIN_COVERAGE_SENTENCE_SPREAD)
+    else:
+        verdict = "spread signals withheld: model too sparse (needs {0:.2f}); mean surprisal only".format(
+            MIN_COVERAGE_TOKEN_SPREAD)
+    print("bigram coverage {0:.3f}  -> {1}".format(coverage, verdict))
+
+
 def cmd_inspect(args: argparse.Namespace) -> int:
+    # Contextual signals only exist relative to the whole corpus, so inspecting even
+    # one document needs the pass-1 model. Without it, inspect would silently show a
+    # different signal set from profile for the same document.
+    bound = []
+    if contextual_registered():
+        if args.reference:
+            context = build_context(args.reference, text_field=args.text_field, source=SOURCE_REFERENCE)
+        elif args.corpus != "-":
+            context = build_context(args.corpus, text_field=args.text_field,
+                                    limit=args.limit, min_chars=args.min_chars)
+        else:
+            context = None
+            sys.stderr.write("note: surprisal family skipped for stdin (see 'chaff profile')\n")
+        if context is not None:
+            bound = bind_contextual(context)
+
     shown = 0
     for doc in iter_documents(
         args.corpus, text_field=args.text_field,
         limit=args.limit, min_chars=args.min_chars,
     ):
         view = build_view(doc.text)
-        row = profile_document(doc, view=view)
+        row = profile_document(doc, view=view, bound=bound)
         print("=" * 72)
         print("doc_id      {0}".format(doc.doc_id))
         if doc.label:
@@ -158,8 +207,10 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 
 def cmd_families(_args: argparse.Namespace) -> int:
     active = dict()
+    contextual = {name for name, _ in contextual_registered()}
     for name, family in registered():
-        active.setdefault(family, []).append(name)
+        label = name + ("   (needs a corpus pass)" if name in contextual else "")
+        active.setdefault(family, []).append(label)
 
     print("metric families\n")
     for family in FAMILIES:
@@ -167,7 +218,8 @@ def cmd_families(_args: argparse.Namespace) -> int:
         names = active.get(family, [])
         # Extractors, not signals: one extractor emits several related signals when
         # they share a computation (lexical_profile emits six from one word count).
-        status = "{0} extractors".format(len(names)) if names else "not yet implemented"
+        status = ("{0} extractor{1}".format(len(names), "" if len(names) == 1 else "s")
+                  if names else "not yet implemented")
         print("  {0:<16} {1:<9} {2:<20} {3}".format(family, phase, status, blurb))
         for name in sorted(names):
             print("      - {0}".format(name))
@@ -188,7 +240,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     handlers = {"profile": cmd_profile, "inspect": cmd_inspect, "families": cmd_families}
     try:
         return handlers[args.command](args)
-    except CorpusError as exc:
+    except (CorpusError, StreamMismatchError) as exc:
         sys.stderr.write("error: {0}\n".format(exc))
         return 2
     except BrokenPipeError:

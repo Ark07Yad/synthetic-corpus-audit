@@ -1,9 +1,24 @@
 """Corpus profiling orchestration.
 
-Phase 1 scope: stream a corpus, build the shared text view for each document, run
-whatever metric extractors are registered, and report corpus shape. Contamination
-*scoring* arrives in phase 5 and plugs in here without changing this structure —
-the per-document signal list is already threaded through.
+Stream a corpus, build the shared text view for each document, run every registered
+extractor, and report corpus shape. Contamination *scoring* arrives in phase 5.
+
+Two passes, only when needed
+----------------------------
+Since phase 3 some extractors need corpus-level state (the language model), which is
+built by an extra pass over the corpus **before** documents are profiled:
+
+    pass 1   build_context()   stream words only -> NgramLM -> CorpusContext
+    pass 2   profile_corpus()  stream documents  -> signals, LM bound in
+
+The corpus is re-read rather than cached (ARCHITECTURE.md §5): holding a crawl dump
+in memory would reintroduce the ceiling the streaming reader exists to avoid. If no
+contextual extractor is active, pass 1 is skipped and the corpus is read once.
+
+Both passes must see the identical document stream, because leave-one-out scoring
+subtracts each document's counts from a model that must contain them. The same
+``text_field`` / ``limit`` / ``min_chars`` are passed to both, and the document count
+is checked afterwards; the LM raises on any impossible count before that.
 """
 
 from __future__ import annotations
@@ -11,13 +26,15 @@ from __future__ import annotations
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from .context import SOURCE_REFERENCE, SOURCE_SELF, CorpusContext
 from .corpus_io import iter_documents
 from .document import Document
-from .metrics import Signal, extract_signals, registered
+from .lm import NgramLM, StreamMismatchError
+from .metrics import Bound, Signal, bind_contextual, contextual_registered, extract_signals, registered
 from .stats import describe
-from .tokenization import MIN_ANALYSABLE_WORDS, TextView, build_view
+from .tokenization import MIN_ANALYSABLE_WORDS, TextView, build_view, tokenize_words
 
 #: Per-document rows retained in memory when the caller is not streaming to a file.
 #: Profiling a crawl dump must not be bounded by RAM, so the rows are capped and the
@@ -75,6 +92,9 @@ class CorpusProfile:
     type_summary: Dict[str, float] = field(default_factory=dict)
     rows: List[DocProfile] = field(default_factory=list)
     rows_truncated: bool = False
+    context_source: Optional[str] = None
+    lm_summary: Dict[str, float] = field(default_factory=dict)
+    notes: List[str] = field(default_factory=list)
 
     @property
     def corpus_ttr(self) -> float:
@@ -105,7 +125,42 @@ class CorpusProfile:
             "metrics_active": self.metrics_active,
             "length_summary": {k: round(v, 3) for k, v in self.length_summary.items()},
             "type_summary": {k: round(v, 3) for k, v in self.type_summary.items()},
+            "context_source": self.context_source,
+            "language_model": {k: (round(v, 6) if isinstance(v, float) else v)
+                               for k, v in self.lm_summary.items()},
+            "notes": self.notes,
         }
+
+
+def build_context(
+    path: str,
+    *,
+    text_field: Optional[str] = None,
+    limit: Optional[int] = None,
+    min_chars: int = 0,
+    source: str = SOURCE_SELF,
+) -> CorpusContext:
+    """Pass 1: stream the corpus once and build the corpus-level context.
+
+    Only words are needed, so documents are tokenized with ``tokenize_words`` directly
+    rather than through a full ``TextView`` — the same function ``build_view`` uses,
+    which is what guarantees pass 1 counts exactly the words pass 2 will score.
+
+    A self-built model is pruned (lossless under leave-one-out). A reference model is
+    not, since the documents it scores were never part of it.
+    """
+    lm = NgramLM()
+    n_documents = 0
+    for doc in iter_documents(path, text_field=text_field, limit=limit, min_chars=min_chars):
+        lm.observe(tokenize_words(doc.text))
+        n_documents += 1
+    lm.finalize(prune=(source == SOURCE_SELF))
+    return CorpusContext(
+        source=source,
+        n_documents=n_documents,
+        lm=lm,
+        reference_path=path if source == SOURCE_REFERENCE else None,
+    )
 
 
 def profile_document(
@@ -113,10 +168,15 @@ def profile_document(
     *,
     families: Optional[Iterable[str]] = None,
     view: Optional[TextView] = None,
+    bound: Optional[Sequence[Bound]] = None,
 ) -> DocProfile:
-    """Build the text view for one document and run the registered extractors."""
+    """Build the text view for one document and run the registered extractors,
+    plus any contextual extractors already bound to a corpus context."""
     view = view if view is not None else build_view(doc.text)
-    signals = extract_signals(doc, view, families=families) if view.is_analysable else []
+    signals = (
+        extract_signals(doc, view, families=families, bound=bound)
+        if view.is_analysable else []
+    )
     return DocProfile(
         doc_id=doc.doc_id,
         source=doc.source,
@@ -140,6 +200,8 @@ def profile_corpus(
     families: Optional[Iterable[str]] = None,
     row_cap: int = DEFAULT_ROW_CAP,
     on_row: Optional[Any] = None,
+    reference: Optional[str] = None,
+    context: Optional[CorpusContext] = None,
 ) -> CorpusProfile:
     """Stream a corpus and profile every document in it.
 
@@ -149,14 +211,40 @@ def profile_corpus(
         Optional callable invoked with each :class:`DocProfile` as it is produced.
         The CLI uses it to stream per-document rows straight to disk so that a
         large corpus never has to be held in memory.
+    reference:
+        Path to a trusted corpus. The language model is built from it instead of from
+        the audited corpus, and documents are scored against it directly. Strictly
+        better when one is available, and it also removes pass 1 over ``path``.
+    context:
+        A prebuilt context, bypassing pass 1 entirely. Mostly for tests and for
+        callers profiling the same corpus repeatedly.
     """
     started = time.time()
-    active = registered(families)
-    profile = CorpusProfile(
-        path=path,
-        families_active=sorted({family for _, family in active}),
-        metrics_active=[name for name, _ in active],
-    )
+    profile = CorpusProfile(path=path)
+
+    wants_context = bool(contextual_registered(families))
+    if context is None and wants_context:
+        if reference is not None:
+            context = build_context(reference, text_field=text_field, source=SOURCE_REFERENCE)
+        elif path == "-":
+            profile.notes.append(
+                "surprisal family skipped: stdin cannot be read twice, and the corpus "
+                "language model needs its own pass. Pass a file, or supply --reference."
+            )
+        else:
+            context = build_context(path, text_field=text_field, limit=limit, min_chars=min_chars)
+
+    bound: List[Bound] = bind_contextual(context, families) if context is not None else []
+    if context is not None and context.lm is not None:
+        profile.context_source = context.source
+        profile.lm_summary = context.lm.summary()
+
+    bound_names = {name for name, _, _ in bound}
+    contextual_names = {name for name, _ in contextual_registered(families)}
+    active = [(name, family) for name, family in registered(families)
+              if name not in contextual_names or name in bound_names]
+    profile.families_active = sorted({family for _, family in active})
+    profile.metrics_active = [name for name, _ in active]
 
     vocabulary: "Counter[str]" = Counter()
     lengths: List[float] = []
@@ -166,7 +254,7 @@ def profile_corpus(
         path, text_field=text_field, limit=limit, min_chars=min_chars
     ):
         view = build_view(doc.text)
-        row = profile_document(doc, families=families, view=view)
+        row = profile_document(doc, families=families, view=view, bound=bound)
 
         profile.n_documents += 1
         profile.n_words += view.n_words
@@ -182,6 +270,13 @@ def profile_corpus(
             profile.rows.append(row)
         else:
             profile.rows_truncated = True
+
+    if context is not None and context.leave_one_out and context.n_documents != profile.n_documents:
+        raise StreamMismatchError(
+            "pass 1 saw {0} documents but pass 2 saw {1}; the corpus changed between "
+            "passes, so leave-one-out scores are invalid".format(
+                context.n_documents, profile.n_documents)
+        )
 
     profile.vocabulary_size = len(vocabulary)
     profile.hapax_count = sum(1 for count in vocabulary.values() if count == 1)

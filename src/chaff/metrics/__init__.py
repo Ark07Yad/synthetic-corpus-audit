@@ -22,6 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from ..context import CorpusContext
 from ..document import Document
 from ..tokenization import TextView
 
@@ -80,7 +81,16 @@ class Signal:
 #: extractors stay unit-testable on a single document.
 Extractor = Callable[[Document, TextView], Sequence[Signal]]
 
+#: A factory receives the corpus context after pass 1 and returns an ordinary pure
+#: extractor with that context closed over — or ``None`` when the context lacks what
+#: it needs, in which case the extractor is skipped rather than run on bad inputs.
+ExtractorFactory = Callable[[CorpusContext], Optional[Extractor]]
+
+#: ``(name, family, extractor)`` — a contextual extractor after binding.
+Bound = Tuple[str, str, Extractor]
+
 _REGISTRY: "Dict[str, Tuple[str, Extractor]]" = {}
+_CONTEXTUAL: "Dict[str, Tuple[str, ExtractorFactory]]" = {}
 
 
 def register(name: str, family: str) -> Callable[[Extractor], Extractor]:
@@ -89,34 +99,81 @@ def register(name: str, family: str) -> Callable[[Extractor], Extractor]:
         raise ValueError("unknown family: {0}".format(family))
 
     def decorator(fn: Extractor) -> Extractor:
-        if name in _REGISTRY:
-            raise ValueError("extractor already registered: {0}".format(name))
+        _check_unique(name)
         _REGISTRY[name] = (family, fn)
         return fn
 
     return decorator
 
 
+def register_contextual(name: str, family: str) -> Callable[[ExtractorFactory], ExtractorFactory]:
+    """Decorator registering an extractor *factory* that needs corpus context.
+
+    Its presence is what makes the pipeline run a first pass: if no contextual
+    extractor is active, the corpus is read exactly once, as in phases 1 and 2.
+    """
+    if family not in FAMILIES:
+        raise ValueError("unknown family: {0}".format(family))
+
+    def decorator(factory: ExtractorFactory) -> ExtractorFactory:
+        _check_unique(name)
+        _CONTEXTUAL[name] = (family, factory)
+        return factory
+
+    return decorator
+
+
+def _check_unique(name: str) -> None:
+    # One namespace across both tables: a name identifies an extractor in reports
+    # regardless of whether it needed a corpus pass.
+    if name in _REGISTRY or name in _CONTEXTUAL:
+        raise ValueError("extractor already registered: {0}".format(name))
+
+
 def registered(families: Optional[Iterable[str]] = None) -> List[Tuple[str, str]]:
-    """Return ``(name, family)`` for registered extractors, sorted by name."""
+    """Return ``(name, family)`` for every registered extractor, sorted by name."""
+    wanted = set(families) if families else None
+    both = [(n, f) for n, (f, _) in _REGISTRY.items()] + [(n, f) for n, (f, _) in _CONTEXTUAL.items()]
+    return sorted((n, f) for n, f in both if wanted is None or f in wanted)
+
+
+def contextual_registered(families: Optional[Iterable[str]] = None) -> List[Tuple[str, str]]:
+    """Return ``(name, family)`` for extractors that need a corpus pass."""
     wanted = set(families) if families else None
     return sorted(
-        (name, family)
-        for name, (family, _) in _REGISTRY.items()
-        if wanted is None or family in wanted
+        (n, f) for n, (f, _) in _CONTEXTUAL.items() if wanted is None or f in wanted
     )
+
+
+def bind_contextual(
+    context: CorpusContext,
+    families: Optional[Iterable[str]] = None,
+) -> List[Bound]:
+    """Instantiate every active contextual factory against ``context``."""
+    wanted = set(families) if families else None
+    bound: List[Bound] = []
+    for name in sorted(_CONTEXTUAL):
+        family, factory = _CONTEXTUAL[name]
+        if wanted is not None and family not in wanted:
+            continue
+        extractor = factory(context)
+        if extractor is not None:
+            bound.append((name, family, extractor))
+    return bound
 
 
 def extract_signals(
     doc: Document,
     view: TextView,
     families: Optional[Iterable[str]] = None,
+    bound: Optional[Sequence[Bound]] = None,
 ) -> List[Signal]:
-    """Run every registered extractor over one document and collect its signals."""
+    """Run every registered extractor, plus any bound contextual ones, over one
+    document. Order is by extractor name across both kinds, so output is stable."""
     wanted = set(families) if families else None
+    runnable = [(n, f, fn) for n, (f, fn) in _REGISTRY.items()] + list(bound or [])
     out: List[Signal] = []
-    for name in sorted(_REGISTRY):
-        family, fn = _REGISTRY[name]
+    for name, family, fn in sorted(runnable, key=lambda item: item[0]):
         if wanted is not None and family not in wanted:
             continue
         out.extend(fn(doc, view))
@@ -133,17 +190,21 @@ def clear_registry() -> None:
     empty registry and silently passes for the wrong reason.
     """
     _REGISTRY.clear()
+    _CONTEXTUAL.clear()
 
 
-def registry_snapshot() -> "Dict[str, Tuple[str, Extractor]]":
-    """A copy of the current registrations. Test-support only."""
-    return dict(_REGISTRY)
+def registry_snapshot() -> Tuple[Dict[str, Tuple[str, Extractor]], Dict[str, Tuple[str, ExtractorFactory]]]:
+    """A copy of both registration tables. Test-support only."""
+    return dict(_REGISTRY), dict(_CONTEXTUAL)
 
 
-def restore_registry(snapshot: "Dict[str, Tuple[str, Extractor]]") -> None:
-    """Replace the registry with ``snapshot``. Test-support only."""
+def restore_registry(snapshot) -> None:
+    """Replace both registration tables from ``snapshot``. Test-support only."""
+    plain, contextual = snapshot
     _REGISTRY.clear()
-    _REGISTRY.update(snapshot)
+    _REGISTRY.update(plain)
+    _CONTEXTUAL.clear()
+    _CONTEXTUAL.update(contextual)
 
 
 # Importing the metric modules is what registers their extractors. Discovery is
@@ -154,3 +215,4 @@ def restore_registry(snapshot: "Dict[str, Tuple[str, Extractor]]") -> None:
 from . import entropy as _entropy  # noqa: E402,F401
 from . import ngram as _ngram      # noqa: E402,F401
 from . import zipf as _zipf        # noqa: E402,F401
+from . import surprisal as _surprisal  # noqa: E402,F401
