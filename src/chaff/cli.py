@@ -31,8 +31,8 @@ from .tokenization import build_view
 PHASE_PLAN = {
     "distributional": ("phase 2", "entropy, Zipf slope, frequency spectrum, Heaps' law, MTLD, n-gram repetition"),
     "surprisal": ("phase 3", "corpus-internal LM: mean surprisal, coverage-gated spread, recycled spans"),
-    "artifact": ("phase 4", "formatting watermarks, hedging, system-prompt echoes"),
-    "reasoning": ("phase 4", "redundant reasoning-step loops, state-gain analysis"),
+    "artifact": ("phase 4", "assistant echoes, hedging, LLM lexicon, transitions, bold labels, human noise"),
+    "reasoning": ("phase 4", "windowed step novelty, stalled-step ratio"),
 }
 
 

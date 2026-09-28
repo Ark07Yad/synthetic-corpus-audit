@@ -216,3 +216,5 @@ from . import entropy as _entropy  # noqa: E402,F401
 from . import ngram as _ngram      # noqa: E402,F401
 from . import zipf as _zipf        # noqa: E402,F401
 from . import surprisal as _surprisal  # noqa: E402,F401
+from . import artifacts as _artifacts  # noqa: E402,F401
+from . import reasoning as _reasoning  # noqa: E402,F401

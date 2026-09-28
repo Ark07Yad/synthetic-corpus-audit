@@ -41,3 +41,6 @@ data/raw/
 .DS_Store
 .idea/
 .vscode/
+
+# benchmark corpora are regenerated from the local system, never committed
+benchmarks/out/

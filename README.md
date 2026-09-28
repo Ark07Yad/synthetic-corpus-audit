@@ -6,9 +6,9 @@ Find AI-generated text in a pre-training corpus *before* it poisons your tokeniz
 
 [![ci](https://github.com/Ark07Yad/synthetic-corpus-audit/actions/workflows/ci.yml/badge.svg)](https://github.com/Ark07Yad/synthetic-corpus-audit/actions/workflows/ci.yml)
 ![python](https://img.shields.io/badge/python-3.9%2B-blue)
-![tests](https://img.shields.io/badge/tests-108-brightgreen)
+![tests](https://img.shields.io/badge/tests-158-brightgreen)
 ![dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)
-![status](https://img.shields.io/badge/status-phase%203%20of%206-orange)
+![status](https://img.shields.io/badge/status-phase%204%20of%206-orange)
 
 ---
 
@@ -82,8 +82,33 @@ human writing out of the results.
 |---|---|---|
 | **distributional** | Zipf slope, frequency-spectrum slope, Heaps' β, branching entropy, hapax ratio, MTLD, Yule's K, 4/8-gram repetition, zlib compressibility | **2 — done** |
 | **surprisal** | mean surprisal, surprisal spread at word and sentence scale (gated on model adequacy), recycled-span runs | **3 — done** |
-| **artifact** | system-prompt echoes, hedging scaffolds, markdown watermarks, overused lexicon, *absence* of human error | 4 |
-| **reasoning** | reasoning-step **state gain**, restatement ratio, loop detection | 4 |
+| **artifact** | assistant echoes, hedging scaffolds, bold-label markdown, LLM-era lexicon, discourse-adverb transitions, *absence* of human typing noise | **4 — done** |
+| **reasoning** | windowed step novelty, stalled-step ratio | **4 — done** |
+
+### The artifact and reasoning families, validated against guaranteed-human text
+
+Artifact detectors can't be validated on text I wrote myself. If I write "delve" and then
+detect "delve", I've only proven the regex works. Their real risk is false positives,
+so they're measured against text that is **human by date**: Python 3.9 standard-library
+docstrings (released June 2021, before ChatGPT) plus 1,439 man pages, 1,748 documents in
+all. Detector lists were pruned on one half and evaluated on the other.
+
+| Detector | Fires on held-out human docs |
+|---|---|
+| assistant echoes ("As an AI language model", "I hope this helps") | **0.0%** |
+| bold-label markdown (`**Scalability:**`) | **0.0%** |
+| LLM-era lexicon | **0.7%** (was 11% before pruning) |
+| hedging scaffolds | 2.6% |
+| transition adverbs | 9.8% |
+
+The lexicon result is the instructive one. Words like "underscore", "realm" and "harness"
+are LLM tells in prose and **domain vocabulary** in technical text (the `_` character,
+Kerberos, test harnesses), and they fired at LLM-like rates on human documents. The same
+benchmark checks the assumption the whole scoring design rests on: that the metric
+families are independent. A reasoning signal turned out to be re-measuring lexical
+repetition (|ρ| 0.74 with the distributional family) and was removed; the strongest
+remaining cross-family correlation is 0.49. Details and caveats:
+[`benchmarks/README.md`](benchmarks/README.md).
 
 ### The surprisal family, and a thesis this project had to correct
 
@@ -113,25 +138,26 @@ The toy language has no topic structure, so this doesn't settle whether *real* h
 is bursty because of topic shifts. That's a phase 6 measurement on real data, not
 something assumed here.
 
-## Status: phase 3 of 6
+## Status: phase 4 of 6
 
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Foundation: tokenization, streaming corpus I/O, metric contract, CLI, sample corpus, CI | **done** |
 | 2 | Distributional family — 3 extractors, up to 9 signals per document | **done** |
 | 3 | Surprisal family — two-pass pipeline, leave-one-out trigram LM, coverage-gated signals | **done** |
-| 4 | Artifact + reasoning families | next |
-| 5 | Robust score fusion, tiers, MD/JSON/HTML reports | planned |
+| 4 | Artifact + reasoning families, false-positive benchmark on guaranteed-human text | **done** |
+| 5 | Robust score fusion, tiers, MD/JSON/HTML reports | next |
 | 6 | Calibration on a labelled corpus, published precision/recall, graphify graph | planned |
 
-chaff computes and emits distributional and surprisal signals per document. It does
-**not** yet fuse them into a contamination score. That's phase 5, and `chaff families`
+chaff computes and emits signals from all four families per document. It does **not**
+yet fuse them into a contamination score. That's phase 5, and `chaff families`
 will tell you so rather than pretending otherwise.
 
 Signals are implemented and unit-tested against controlled corpora with known
 properties: Zipfian distributions at known exponents, artificially truncated tails,
-nucleus-truncated sampling from a known language. They are **not yet calibrated against
-real labelled data**. The 10-document sample corpus averages 150 words, which is below
+nucleus-truncated sampling from a known language. Their false-positive behaviour is
+measured on 1,748 guaranteed-human documents. Their **true-positive** rates are not
+measured yet: that needs an independent corpus of real model output. The 10-document sample corpus averages 150 words, which is below
 the length at which most of these metrics carry information, and at 1,475 tokens it's
 far too small to train a language model. Building a long-document evaluation corpus is
 phase 6, and no accuracy claim will be made before then.
@@ -151,6 +177,12 @@ tokens/s for the scoring pass with every family active.
 - **Not for academic integrity.** Wrong granularity, and the false-positive cost falls on
   a person rather than on a row in a dataset. Please do not use it that way.
 - Single-document scores are noisy below ~50 words and are reported, not scored.
+- **Artifact false positives are measured on technical text only.** Literary and
+  journalistic writing uses words like "testament" and "bustling" legitimately, and that
+  rate is unmeasured until phase 6.
+- **The families are not fully independent.** The strongest measured cross-family
+  correlation on human text is 0.49, so two families firing together is weaker evidence
+  than two truly independent tests would be.
 - **Corpus-relative surprisal measures typicality within your corpus.** Boilerplate only
   looks predictable if the corpus contains lots of similar boilerplate. That's usually
   true of a web crawl full of contracts and cookie banners, and it's exactly where the
@@ -167,7 +199,8 @@ tokens/s for the scoring pass with every family active.
 |---|---|
 | `src/chaff/` | The package |
 | `src/chaff/metrics/` | The `Signal` contract and the metric families |
-| `tests/` | 108 tests |
+| `tests/` | 158 tests |
+| [`benchmarks/`](benchmarks/) | false-positive benchmark on guaranteed-human text |
 | [`data/samples/`](data/samples/) | 10 labelled documents, including deliberate hard cases |
 
 ## Licence
