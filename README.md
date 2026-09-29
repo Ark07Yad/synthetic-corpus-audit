@@ -6,9 +6,9 @@ Find AI-generated text in a pre-training corpus *before* it poisons your tokeniz
 
 [![ci](https://github.com/Ark07Yad/synthetic-corpus-audit/actions/workflows/ci.yml/badge.svg)](https://github.com/Ark07Yad/synthetic-corpus-audit/actions/workflows/ci.yml)
 ![python](https://img.shields.io/badge/python-3.9%2B-blue)
-![tests](https://img.shields.io/badge/tests-158-brightgreen)
+![tests](https://img.shields.io/badge/tests-203-brightgreen)
 ![dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)
-![status](https://img.shields.io/badge/status-phase%204%20of%206-orange)
+![status](https://img.shields.io/badge/status-phase%205%20of%206-orange)
 
 ---
 
@@ -56,11 +56,22 @@ droppable onto the data node that already holds your dump. CI enforces this.
 ## Usage
 
 ```bash
-chaff profile corpus.jsonl.gz              # corpus shape and signal summary
-chaff profile corpus.jsonl --out rows.jsonl  # per-document rows, joins back on doc_id
-chaff inspect corpus.jsonl -n 5            # see individual docs as chaff sees them
-chaff profile crawl.jsonl --reference wiki.jsonl  # score against a trusted corpus instead
-chaff families                             # what is implemented, and what is coming
+chaff score corpus.jsonl --out scores.jsonl --report report.html   # tier, score and evidence per document
+chaff explain scores.jsonl <doc_id>                                  # why one document got its tier
+chaff report scores.jsonl --format md                                # re-render the run as md / json / html
+chaff score crawl.jsonl --reference trusted.jsonl --out scores.jsonl # normalise against a trusted corpus
+
+chaff profile corpus.jsonl --out rows.jsonl  # raw signals per document, no scoring
+chaff inspect corpus.jsonl -n 5              # see individual docs as chaff sees them
+chaff families                               # what is implemented
+```
+
+`scores.jsonl` has one line per document and joins back to your corpus on `doc_id`:
+
+```json
+{"doc_id": "s_reasoning_01", "tier": "LIKELY_SYNTHETIC", "score": 98.0,
+ "families_fired": ["reasoning", "distributional"],
+ "evidence": [{"signal": "stalled_step_ratio", "value": 0.3, "z": 4.65, "basis": "corpus", ...}]}
 ```
 
 The surprisal family reads the corpus **twice**: once to build a language model, once to
@@ -84,6 +95,41 @@ human writing out of the results.
 | **surprisal** | mean surprisal, surprisal spread at word and sentence scale (gated on model adequacy), recycled-span runs | **3 — done** |
 | **artifact** | assistant echoes, hedging scaffolds, bold-label markdown, LLM-era lexicon, discourse-adverb transitions, *absence* of human typing noise | **4 — done** |
 | **reasoning** | windowed step novelty, stalled-step ratio | **4 — done** |
+
+### How a score is made
+
+Every number below was measured on held-out data that took no part in setting it.
+
+1. **Normalise** each signal to a z-score. Continuous signals are compared with documents
+   *of similar length* in the corpus: on human text, eight distributional signals
+   correlate with length at |ρ| 0.48–0.95, so an unstratified "corpus-relative" z would
+   mostly rank documents by length. Length strata bring that to |ρ| ≤ 0.06. Artifact
+   signals are compared with **guaranteed-human text** instead, because they're zero for
+   most documents, and because in a crawl that's 20% synthetic, hedging would otherwise
+   look "normal".
+2. **Combine within each family.** Signals measuring the same property are averaged; the
+   artifact family takes its strongest tell, corrected for having looked at six.
+3. **Tier.** Each family has a threshold calibrated on 877 human documents.
+   **Two or more families past their threshold → `LIKELY_SYNTHETIC`**; one → `SUSPECT`;
+   none → `CLEAN`. No single family, however strong, can produce `LIKELY_SYNTHETIC`.
+4. **Score 0–100** = the document's combined evidence (Fisher's method across families)
+   as a **percentile among clean human documents**. 50 is typical human text; 99 means
+   more evidence than 99% of it.
+
+On 871 held-out human documents:
+
+| | Result |
+|---|---|
+| tiered `LIKELY_SYNTHETIC` | **0.92%** (target ≤ 1%) |
+| tiered `SUSPECT` | 8.15% |
+| median score / 95th percentile | 50.2 / 95.5 |
+| lowest score of any `SUSPECT` document | 61.2 (so tier and score agree) |
+
+The corroboration rule rests on the families being independent, and they aren't fully:
+on clean text, two families fire together **2.6× more often** than independence would
+predict. Thresholds are calibrated on that *measured* joint rate, so the 0.92% already
+includes it. A tool that assumed independence would have understated its false-positive
+rate by that factor.
 
 ### The artifact and reasoning families, validated against guaranteed-human text
 
@@ -138,7 +184,7 @@ The toy language has no topic structure, so this doesn't settle whether *real* h
 is bursty because of topic shifts. That's a phase 6 measurement on real data, not
 something assumed here.
 
-## Status: phase 4 of 6
+## Status: phase 5 of 6
 
 | Phase | Scope | State |
 |---|---|---|
@@ -146,18 +192,20 @@ something assumed here.
 | 2 | Distributional family — 3 extractors, up to 9 signals per document | **done** |
 | 3 | Surprisal family — two-pass pipeline, leave-one-out trigram LM, coverage-gated signals | **done** |
 | 4 | Artifact + reasoning families, false-positive benchmark on guaranteed-human text | **done** |
-| 5 | Robust score fusion, tiers, MD/JSON/HTML reports | next |
-| 6 | Calibration on a labelled corpus, published precision/recall, graphify graph | planned |
+| 5 | Fusion: length-stratified normalisation, calibrated tiers, Fisher score, `score` / `explain` / `report` | **done** |
+| 6 | Real-model-output evaluation corpus, published precision/recall, non-technical human baseline | next |
 
-chaff computes and emits signals from all four families per document. It does **not**
-yet fuse them into a contamination score. That's phase 5, and `chaff families`
-will tell you so rather than pretending otherwise.
+chaff scores, tiers and explains every document. What it doesn't have yet is a measured
+**true-positive** rate.
 
 Signals are implemented and unit-tested against controlled corpora with known
 properties: Zipfian distributions at known exponents, artificially truncated tails,
 nucleus-truncated sampling from a known language. Their false-positive behaviour is
 measured on 1,748 guaranteed-human documents. Their **true-positive** rates are not
-measured yet: that needs an independent corpus of real model output. The 10-document sample corpus averages 150 words, which is below
+measured yet: that needs an independent corpus of real model output. On the 10-document
+sample corpus, scored against the human baseline as reference, 4 of 5 synthetic documents
+are flagged and 0 of 5 human ones; the fifth synthetic document was written to evade
+every detector and does. That demonstrates the mechanism, not an accuracy. The 10-document sample corpus averages 150 words, which is below
 the length at which most of these metrics carry information, and at 1,475 tokens it's
 far too small to train a language model. Building a long-document evaluation corpus is
 phase 6, and no accuracy claim will be made before then.
@@ -167,6 +215,11 @@ tokens/s for the scoring pass with every family active.
 
 ## Limitations, stated up front
 
+- **Corpus-relative scoring penalises minority genres.** A document is scored against
+  others *in the same corpus*, so a genre that's rare there looks unusual. On the
+  calibration baseline, the distributional family fired on 6.1% of the minority genre
+  (stdlib docstrings) against 1.8% of the majority (man pages). Use `--reference` with a
+  genre-matched trusted corpus when you have one.
 - **This is a triage instrument, not an AI detector.** It ranks documents for review. It
   does not prove any individual document was machine-generated, and it never claims which
   model wrote it.
@@ -199,7 +252,7 @@ tokens/s for the scoring pass with every family active.
 |---|---|
 | `src/chaff/` | The package |
 | `src/chaff/metrics/` | The `Signal` contract and the metric families |
-| `tests/` | 158 tests |
+| `tests/` | 203 tests |
 | [`benchmarks/`](benchmarks/) | false-positive benchmark on guaranteed-human text |
 | [`data/samples/`](data/samples/) | 10 labelled documents, including deliberate hard cases |
 

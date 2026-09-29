@@ -207,6 +207,22 @@ class NgramLM:
         repeated = sum(c for c in self.counts[2].values() if c >= 2)
         return repeated / float(self.n_tokens)
 
+    def bigram_hits(self, words: Sequence[str]) -> Tuple[int, int]:
+        """``(positions whose bigram the model has seen, positions)`` for a document that
+        was **not** part of training — the reference-mode counterpart of
+        :attr:`bigram_coverage`. Summed over an audited corpus it says how well a
+        reference model covers text it never saw (R4), which the reference model's own
+        coverage cannot: a model can be well estimated and still out of domain.
+        """
+        if self.pruned:
+            raise ValueError("bigram_hits needs an unpruned (reference) model")
+        if self.order < 2 or not words:
+            return 0, len(words)
+        seq = self._padded(words)
+        table = self.counts[2]
+        hits = sum(1 for i in range(self.order - 1, len(seq)) if table.get((seq[i - 1], seq[i]), 0) > 0)
+        return hits, len(words)
+
     @property
     def n_entries(self) -> int:
         return sum(len(t) for k in range(1, self.order + 1)

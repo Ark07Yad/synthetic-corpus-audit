@@ -23,6 +23,7 @@ is checked afterwards; the LM raises on any impossible count before that.
 
 from __future__ import annotations
 
+import json
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -95,6 +96,9 @@ class CorpusProfile:
     context_source: Optional[str] = None
     lm_summary: Dict[str, float] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
+    #: Reference mode only: share of audited word positions whose bigram the reference
+    #: model has seen (R4). ``None`` when the model was built from this corpus.
+    audited_coverage: Optional[float] = None
 
     @property
     def corpus_ttr(self) -> float:
@@ -129,6 +133,7 @@ class CorpusProfile:
             "language_model": {k: (round(v, 6) if isinstance(v, float) else v)
                                for k, v in self.lm_summary.items()},
             "notes": self.notes,
+            "audited_coverage": None if self.audited_coverage is None else round(self.audited_coverage, 6),
         }
 
 
@@ -249,6 +254,9 @@ def profile_corpus(
     vocabulary: "Counter[str]" = Counter()
     lengths: List[float] = []
     type_counts: List[float] = []
+    measure_coverage = (context is not None and context.lm is not None
+                        and context.source == SOURCE_REFERENCE)
+    hits = positions = 0
 
     for doc in iter_documents(
         path, text_field=text_field, limit=limit, min_chars=min_chars
@@ -261,6 +269,10 @@ def profile_corpus(
         if row.analysable:
             profile.n_analysable += 1
         vocabulary.update(view.words)
+        if measure_coverage:
+            h, t = context.lm.bigram_hits(view.words)
+            hits += h
+            positions += t
         lengths.append(float(view.n_words))
         type_counts.append(float(view.n_types))
 
@@ -277,6 +289,9 @@ def profile_corpus(
             "passes, so leave-one-out scores are invalid".format(
                 context.n_documents, profile.n_documents)
         )
+
+    if measure_coverage and positions:
+        profile.audited_coverage = hits / float(positions)
 
     profile.vocabulary_size = len(vocabulary)
     profile.hapax_count = sum(1 for count in vocabulary.values() if count == 1)
@@ -295,3 +310,210 @@ def short_document_note(profile: CorpusProfile) -> Optional[str]:
             "distributional metrics are dominated by sampling noise at that length."
         ).format(skipped, profile.n_documents, MIN_ANALYSABLE_WORDS)
     return None
+
+
+# --------------------------------------------------------------------------- fusion
+#
+# Fusion runs over per-document signal *rows* spilled to disk during pass 2, never over
+# the corpus (R3, D16): contextual signals do not exist until pass 2, and a row is ~20
+# floats against thousands of words. The corpus is therefore still read exactly twice
+# (three times over a reference corpus in reference mode, which also profiles itself).
+
+import heapq
+import os
+import tempfile
+
+from .scoring import (
+    TIER_LIKELY,
+    TIERS,
+    Calibration,
+    Row,
+    ScoredDoc,
+    SignalInfo,
+    build_reference_stats,
+    load_calibration,
+    score_row,
+)
+
+#: Documents kept in memory for the report; the full set is streamed to scores.jsonl.
+DEFAULT_TOP_N = 25
+
+
+def collect_rows(
+    path: str,
+    spill,
+    *,
+    text_field: Optional[str] = None,
+    limit: Optional[int] = None,
+    min_chars: int = 0,
+    context: Optional[CorpusContext] = None,
+    reference: Optional[str] = None,
+) -> "tuple":
+    """Profile a corpus, streaming one :class:`Row` per document to ``spill``.
+
+    Returns ``(CorpusProfile, catalog)``, where the catalog maps every signal name that
+    was emitted to its family, direction and description — read off the ``Signal``
+    objects themselves, so fusion never keeps a second copy of that metadata.
+    """
+    catalog: Dict[str, SignalInfo] = {}
+
+    def keep(doc: DocProfile) -> None:
+        spill.write(Row(doc_id=doc.doc_id, n_words=doc.n_words, analysable=doc.analysable,
+                        signals={s.name: s.value for s in doc.signals},
+                        label=doc.label).to_json() + "\n")
+        for s in doc.signals:
+            if s.name not in catalog:
+                catalog[s.name] = SignalInfo(s.family, s.direction, s.description)
+
+    profile = profile_corpus(path, text_field=text_field, limit=limit, min_chars=min_chars,
+                             on_row=keep, row_cap=0, context=context, reference=reference)
+    return profile, catalog
+
+
+def _read_rows(path: str):
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                yield Row.from_json(line)
+
+
+def coverage_drops(profile: CorpusProfile) -> "tuple":
+    """R4: in reference mode, withhold surprisal spread signals corpus-wide when the
+    reference model covers the *audited* text too thinly — measured on the audited
+    corpus, since a reference model can be well estimated and still out of domain."""
+    from .metrics.surprisal import MIN_COVERAGE_SENTENCE_SPREAD, MIN_COVERAGE_TOKEN_SPREAD
+    c = profile.audited_coverage
+    if c is None:
+        return set(), None
+    if c < MIN_COVERAGE_TOKEN_SPREAD:
+        return ({"surprisal_std", "sentence_surprisal_std"},
+                "reference model covers only {0:.0%} of the audited text's bigrams (needs {1:.0%}); "
+                "surprisal spread signals were withheld from fusion".format(c, MIN_COVERAGE_TOKEN_SPREAD))
+    if c < MIN_COVERAGE_SENTENCE_SPREAD:
+        return ({"sentence_surprisal_std"},
+                "reference model covers {0:.0%} of the audited text's bigrams (needs {1:.0%} for "
+                "sentence-level spread); that signal was withheld".format(c, MIN_COVERAGE_SENTENCE_SPREAD))
+    return set(), None
+
+
+@dataclass
+class ScoreRun:
+    """Corpus-level result of ``chaff score``. Per-document results are streamed to
+    ``scores_path``; this holds only what a report needs."""
+
+    meta: Dict[str, Any]
+    top: List[ScoredDoc]
+
+
+def score_corpus(
+    path: str,
+    *,
+    text_field: Optional[str] = None,
+    limit: Optional[int] = None,
+    min_chars: int = 0,
+    reference: Optional[str] = None,
+    calibration: Optional[Calibration] = None,
+    scores_path: Optional[str] = None,
+    top_n: int = DEFAULT_TOP_N,
+) -> ScoreRun:
+    """Profile, fuse and tier every document in a corpus."""
+    started = time.time()
+    calibration = calibration or load_calibration()
+    notes: List[str] = []
+
+    with tempfile.TemporaryDirectory(prefix="chaff-") as tmp:
+        audited_rows = os.path.join(tmp, "rows.jsonl")
+        if reference is not None:
+            ref_context = build_context(reference, text_field=text_field, source=SOURCE_REFERENCE)
+            reference_rows = os.path.join(tmp, "reference_rows.jsonl")
+            # The reference corpus is profiled leave-one-out against its own (unpruned)
+            # model, so its rows describe how *reference* documents score — the null that
+            # audited documents, scored against the same model, are compared with.
+            self_context = CorpusContext(source=SOURCE_SELF, n_documents=ref_context.n_documents,
+                                         lm=ref_context.lm)
+            with open(reference_rows, "w", encoding="utf-8") as fh:
+                _, ref_catalog = collect_rows(reference, fh, text_field=text_field, context=self_context)
+            with open(audited_rows, "w", encoding="utf-8") as fh:
+                profile, catalog = collect_rows(path, fh, text_field=text_field, limit=limit,
+                                                min_chars=min_chars, context=ref_context)
+            catalog = dict(ref_catalog, **catalog)
+            stats_source = reference_rows
+        else:
+            with open(audited_rows, "w", encoding="utf-8") as fh:
+                profile, catalog = collect_rows(path, fh, text_field=text_field, limit=limit,
+                                                min_chars=min_chars)
+            stats_source = audited_rows
+
+        stats = build_reference_stats(_read_rows(stats_source), catalog)
+        dropped, coverage_note = coverage_drops(profile)
+        notes.extend(profile.notes)
+        if coverage_note:
+            notes.append(coverage_note)
+        reference_n = max((s.n for s in stats.values()), default=0)
+        if reference_n < 50:
+            notes.append(
+                "only {0} scoreable documents in the normalisation reference: corpus-relative "
+                "z-scores rest on a tiny sample. Treat tiers as illustrative, or pass --reference "
+                "with a larger trusted corpus.".format(reference_n))
+        unknown = sorted(n for n, info in catalog.items()
+                         if info.family == "artifact" and n not in calibration.human.counts)
+        if unknown:
+            notes.append("artifact signals missing from the calibration were ignored: " + ", ".join(unknown))
+
+        tier_counts = {t: 0 for t in TIERS}
+        fired_counts: Dict[str, int] = {}
+        histogram = [0] * 20
+        labels: Dict[str, Dict[str, int]] = {}
+        top: List = []
+        out = open(scores_path, "w", encoding="utf-8") if scores_path else None
+        try:
+            for i, row in enumerate(_read_rows(audited_rows)):
+                scored = score_row(row, catalog, stats, calibration, dropped)
+                tier_counts[scored.tier] += 1
+                for family in scored.fired:
+                    fired_counts[family] = fired_counts.get(family, 0) + 1
+                if scored.score is not None:
+                    histogram[min(19, int(scored.score // 5))] += 1
+                    item = (scored.score, -i, scored)
+                    if len(top) < top_n:
+                        heapq.heappush(top, item)
+                    else:
+                        heapq.heappushpop(top, item)
+                if scored.label is not None:
+                    bucket = labels.setdefault(scored.label, {t: 0 for t in TIERS})
+                    bucket[scored.tier] += 1
+                if out is not None:
+                    out.write(json.dumps(scored.to_dict(), ensure_ascii=False) + "\n")
+        finally:
+            if out is not None:
+                out.close()
+
+    scored_total = sum(v for k, v in tier_counts.items() if k != "UNSCORED")
+    meta: Dict[str, Any] = {
+        "chaff_version": _version(),
+        "corpus": path,
+        "reference": reference,
+        "normalisation": "reference corpus" if reference else "audited corpus (corpus-relative)",
+        "documents": profile.n_documents,
+        "scored": scored_total,
+        "tiers": tier_counts,
+        "families_fired": fired_counts,
+        "family_thresholds": calibration.thresholds,
+        "score_histogram": histogram,
+        "labels": labels,
+        "withheld_signals": sorted(dropped),
+        "profile": profile.to_dict(),
+        "calibration": calibration.meta,
+        "notes": notes,
+        "elapsed_seconds": round(time.time() - started, 3),
+    }
+    ranked = [item[2] for item in sorted(top, reverse=True)]
+    if scores_path:
+        with open(scores_path + ".meta.json", "w", encoding="utf-8") as fh:
+            json.dump(dict(meta, top=[d.to_dict() for d in ranked]), fh, indent=2, ensure_ascii=False)
+    return ScoreRun(meta=meta, top=ranked)
+
+
+def _version() -> str:
+    from . import __version__
+    return __version__

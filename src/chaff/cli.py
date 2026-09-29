@@ -1,13 +1,12 @@
 """Command line interface.
 
-    chaff profile <corpus>     corpus shape + registered signals
+    chaff score <corpus>       fuse signals into calibrated tiers, scores and evidence
+    chaff explain <scores> ID  why one document got its tier
+    chaff report <scores>      render a scoring run as Markdown, JSON or HTML
+    chaff profile <corpus>     corpus shape + raw signals, no scoring
     chaff inspect <corpus>     look at individual documents as chaff sees them
     chaff families             what is registered, and which phase ships what
-    chaff version
 
-Commands arriving in later phases (``score``, ``explain``, ``report``, ``dedup``)
-are listed by ``chaff families`` so the tool states its own completeness rather
-than failing with an opaque "invalid choice".
 """
 
 from __future__ import annotations
@@ -23,7 +22,8 @@ from .corpus_io import CorpusError, iter_documents, write_jsonl
 from .lm import StreamMismatchError
 from .metrics import FAMILIES, bind_contextual, contextual_registered, registered
 from .metrics.surprisal import MIN_COVERAGE_SENTENCE_SPREAD, MIN_COVERAGE_TOKEN_SPREAD
-from .pipeline import build_context, profile_corpus, profile_document, short_document_note
+from .pipeline import build_context, profile_corpus, profile_document, score_corpus, short_document_note
+from .report import RENDERERS, load_run
 from .tokenization import build_view
 
 #: Roadmap shown by ``chaff families``. Kept beside the registry so the CLI can
@@ -73,6 +73,25 @@ def _build_parser() -> argparse.ArgumentParser:
                            help="how many documents to show (default: 3)")
 
     sub.add_parser("families", help="list metric families and their delivery phase")
+
+    p_score = sub.add_parser("score", parents=[common],
+                             help="fuse signals into calibrated tiers, scores and evidence")
+    p_score.add_argument("--out", default=None, metavar="SCORES",
+                         help="write one JSON line per document here (plus SCORES.meta.json)")
+    p_score.add_argument("--report", default=None, metavar="PATH",
+                         help="also write a report; format from the extension (.md, .html, .json)")
+    p_score.add_argument("--top", type=int, default=10, help="documents to list (default: 10)")
+    p_score.add_argument("--calibration", default=None, metavar="PATH",
+                         help="use this calibration file instead of the shipped one")
+
+    p_explain = sub.add_parser("explain", help="why one document got its tier")
+    p_explain.add_argument("scores", help="scores file written by 'chaff score --out'")
+    p_explain.add_argument("doc_id")
+
+    p_report = sub.add_parser("report", help="render a scoring run as Markdown, JSON or HTML")
+    p_report.add_argument("scores", help="scores file written by 'chaff score --out'")
+    p_report.add_argument("--format", choices=sorted(RENDERERS), default="md")
+    p_report.add_argument("--output", "-o", default=None, help="write here instead of stdout")
     return parser
 
 
@@ -224,8 +243,108 @@ def cmd_families(_args: argparse.Namespace) -> int:
         for name in sorted(names):
             print("      - {0}".format(name))
 
-    print("\nscoring requires at least two independent families to fire before a")
-    print("document is tiered LIKELY_SYNTHETIC (see OBJECTIVE.md section 4.3).")
+    print("\n'chaff score' tiers a document LIKELY_SYNTHETIC only when two or more families")
+    print("exceed thresholds calibrated on guaranteed-human text (see 'chaff score --help').")
+    return 0
+
+
+def _format_from_path(path: str) -> str:
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    return {"markdown": "md", "htm": "html"}.get(ext, ext) if ext in ("md", "markdown", "html", "htm", "json") else "md"
+
+
+def cmd_score(args: argparse.Namespace) -> int:
+    from .scoring import load_calibration
+    run = score_corpus(
+        args.corpus, text_field=args.text_field, limit=args.limit, min_chars=args.min_chars,
+        reference=args.reference, calibration=load_calibration(args.calibration),
+        scores_path=args.out, top_n=max(args.top, 25),
+    )
+    meta = run.meta
+    if meta["documents"] == 0:
+        sys.stderr.write("no documents found in {0}\n".format(args.corpus))
+        return 1
+
+    total = meta["scored"]
+    tiers = meta["tiers"]
+    print("corpus          {0}".format(meta["corpus"]))
+    print("documents       {0}  ({1} scored)".format(_fmt_int(meta["documents"]), _fmt_int(total)))
+    print("normalised vs   {0}".format(meta["normalisation"]))
+    print("tiers           " + "  ".join("{0} {1}".format(t, tiers.get(t, 0)) for t in
+                                         ("LIKELY_SYNTHETIC", "SUSPECT", "CLEAN", "UNSCORED")))
+    fired = meta["families_fired"]
+    print("families fired  " + ("  ".join("{0} {1}".format(f, n) for f, n in sorted(fired.items())) or "none"))
+    held = ((meta.get("calibration") or {}).get("evaluation") or {}).get("B") or {}
+    if held:
+        print("calibration     on held-out human text: {0:.2%} LIKELY_SYNTHETIC, {1:.2%} SUSPECT".format(
+            held["likely_rate"], held["suspect_rate"]))
+
+    shown = [d for d in run.top if d.tier in ("LIKELY_SYNTHETIC", "SUSPECT")][: args.top]
+    if shown:
+        width = max(len(d.doc_id) for d in shown)
+        print("\n  score  tier              {0:<{1}}  families fired".format("doc", width))
+        for d in shown:
+            print("  {0:5.1f}  {1:<17} {2:<{3}}  {4}".format(d.score, d.tier, d.doc_id, width, "+".join(d.fired)))
+    for note in meta["notes"]:
+        print("\nnote: {0}".format(note))
+
+    sys.stdout.flush()
+    if args.out:
+        sys.stderr.write("\nwrote {0} and {0}.meta.json — try: chaff explain {0} <doc_id>\n".format(args.out))
+    if args.report:
+        fmt = _format_from_path(args.report)
+        top = [d.to_dict() for d in run.top]
+        with open(args.report, "w", encoding="utf-8") as fh:
+            fh.write(RENDERERS[fmt](meta, top))
+        sys.stderr.write("wrote {0} report to {1}\n".format(fmt, args.report))
+    return 0
+
+
+def cmd_explain(args: argparse.Namespace) -> int:
+    found = None
+    with open(args.scores, encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record.get("doc_id") == args.doc_id:
+                found = record
+                break
+    if found is None:
+        sys.stderr.write("no document {0!r} in {1}\n".format(args.doc_id, args.scores))
+        return 1
+
+    print("doc_id    {0}".format(found["doc_id"]))
+    print("tier      {0}".format(found["tier"]))
+    if found["score"] is None:
+        print("          too short to analyse ({0} words); nothing was scored".format(found["n_words"]))
+        return 0
+    print("score     {0:.1f} / 100   (mean human-null percentile of its two strongest families)".format(found["score"]))
+    if "label" in found:
+        print("label     {0}   (ground truth; never read by scoring)".format(found["label"]))
+    print("\nfamily           z        threshold  fired  human percentile  signals")
+    for fam, r in sorted(found["families"].items(), key=lambda kv: -(kv[1]["z"] or 0)):
+        print("  {0:<14} {1:+7.2f}   {2:>8}   {3:<5}  {4:>15}   {5}".format(
+            fam, r["z"], "-" if r["threshold"] is None else "{0:+.2f}".format(r["threshold"]),
+            "yes" if r["fired"] else "no",
+            "-" if r["percentile"] is None else "{0:.1%}".format(r["percentile"]), r["n_signals"]))
+    print("\nstrongest evidence (z > 0 points toward synthetic)")
+    for e in found["evidence"]:
+        print("  {0:+6.2f}  {1:<26} = {2:<10.4g} [{3}, vs {4}]".format(
+            e["z"], e["signal"], e["value"], e["family"], e["basis"]))
+        print("          {0}".format(e["description"]))
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    meta, top = load_run(args.scores)
+    text = RENDERERS[args.format](meta, top)
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        sys.stderr.write("wrote {0} report to {1}\n".format(args.format, args.output))
+    else:
+        print(text)
     return 0
 
 
@@ -237,7 +356,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.print_help()
         return 0
 
-    handlers = {"profile": cmd_profile, "inspect": cmd_inspect, "families": cmd_families}
+    handlers = {"profile": cmd_profile, "inspect": cmd_inspect, "families": cmd_families,
+                "score": cmd_score, "explain": cmd_explain, "report": cmd_report}
     try:
         return handlers[args.command](args)
     except (CorpusError, StreamMismatchError) as exc:

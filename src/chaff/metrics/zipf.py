@@ -119,8 +119,9 @@ def heaps_beta(words: Sequence[str]) -> Optional[float]:
     """Heaps' law exponent: vocabulary ``V`` grows as ``V ~ K * n^beta``.
 
     Measures the rate at which new words keep arriving as a document proceeds — a
-    direct read on tail richness that, unlike a raw type count, is not a function of
-    document length. Human prose sits around 0.4-0.6. Text whose vocabulary saturates
+    direct read on tail richness that depends on length far less than a raw type count
+    does (rho -0.33 with log length on the human baseline, against the near-1 of a type
+    count; fusion's length strata remove the rest). Human prose sits around 0.4-0.6. Text whose vocabulary saturates
     early yields a lower exponent; on controlled corpora a full tail gives 0.68 against
     0.32 for a truncated one, at identical token counts.
 

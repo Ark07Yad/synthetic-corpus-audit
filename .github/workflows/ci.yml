@@ -49,3 +49,7 @@ jobs:
           chaff profile data/samples/mixed_sample.jsonl
           chaff profile data/samples/mixed_sample.jsonl --json > /dev/null
           chaff inspect data/samples/mixed_sample.jsonl -n 1
+          chaff score data/samples/mixed_sample.jsonl --out /tmp/scores.jsonl --report /tmp/report.html
+          chaff explain /tmp/scores.jsonl s_reasoning_01
+          chaff report /tmp/scores.jsonl --format md > /dev/null
+          chaff report /tmp/scores.jsonl --format json > /dev/null

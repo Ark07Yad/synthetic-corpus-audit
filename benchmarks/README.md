@@ -14,6 +14,7 @@ python3 benchmarks/human_baseline.py build             # ~12 s: builds benchmark
 python3 benchmarks/human_baseline.py report            # held-out half B (default)
 python3 benchmarks/human_baseline.py report --half A   # the half that shaped the detector lists
 python3 benchmarks/human_baseline.py report --family artifact
+python3 benchmarks/human_baseline.py calibrate         # fusion thresholds -> src/chaff/calibration.json
 ```
 
 ### Sources
@@ -68,6 +69,37 @@ A reasoning signal, `restatement`, correlated with the distributional family at 
 **0.74** and was removed: it was re-measuring lexical repetition. The strongest remaining
 cross-family correlation is **0.49** (`stalled_step_ratio` × `repetition_4gram`). That's
 weaker coupling, but it isn't independence, and fusion has to account for it.
+
+### Calibrating fusion (phase 5)
+
+`calibrate` learns everything `chaff score` needs from this baseline and writes it to
+`src/chaff/calibration.json` (numbers only, no text, ~17 KB). It learns:
+
+- the human distribution of each artifact signal (from half A),
+- each family's null distribution and threshold,
+- the null distribution of the 0–100 score.
+
+The thresholds come from one per-family α, the largest for which at most **1%** of half-A
+documents reach `LIKELY_SYNTHETIC`. That's α = 0.02. Held-out half B then gives:
+
+| | Half A (fit) | Half B (held out) |
+|---|---|---|
+| `LIKELY_SYNTHETIC` | 0.68% | **0.92%** |
+| `SUSPECT` | 6.16% | 8.15% |
+| `LIKELY` if the families were independent | 0.21% | 0.35% |
+| dependence inflation | 3.3× | **2.6×** |
+
+Because α was chosen on the *measured* joint rate, the calibration already includes the
+families' real dependence. The inflation row shows how much an independence assumption
+would have understated the false-positive rate.
+
+The scoring path (`chaff score`) and the calibration path compute fusion through
+different code. Scoring the whole baseline with `chaff score` reproduces both halves'
+rates exactly, to the hundredth of a percent.
+
+The minority genre pays for corpus-relative normalisation. On half B, the distributional
+family fires on **6.1% of stdlib documents** against 1.8% of man pages, because man pages
+are 81% of the baseline. That's the minority-genre penalty the main README warns about.
 
 ### What this benchmark cannot tell you
 

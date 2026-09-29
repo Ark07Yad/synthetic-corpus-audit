@@ -5,9 +5,16 @@ language, or like language that has been through a sampler that truncates the
 low-probability tail at every decoding step?
 
 Length sensitivity is the recurring trap in this family. Type/token ratio falls as a
-document gets longer *for purely mechanical reasons*, so a naive TTR signal would rank
-documents by length and call it contamination. Every metric here is either
-length-robust by construction (MTLD, Yule's K) or is normalised before it is emitted.
+document gets longer *for purely mechanical reasons*, so raw TTR is not emitted at all.
+
+**Corrected in phase 5.** This docstring used to say every metric here was
+"length-robust by construction (MTLD, Yule's K)". Measured on 1,748 human documents,
+that was false: correlation with log length is +0.95 for unigram entropy, -0.89 for
+normalised entropy, -0.70 for hapax ratio, -0.48 for Yule's K and +0.29 for MTLD. The
+theoretical length-independence of Yule's K and MTLD is asymptotic and does not survive
+real document lengths. Length is handled where it can be handled uniformly — in fusion,
+which normalises every signal within length strata (``chaff.scoring``, R2) and brings
+all of these to |rho| <= 0.06. The raw values emitted here are length-sensitive.
 """
 
 from __future__ import annotations
@@ -84,8 +91,9 @@ def yules_k(words: Sequence[str]) -> float:
 
     ``V_i`` is the number of types occurring exactly ``i`` times and ``N`` is the token
     count. K measures the probability that two tokens drawn at random are the same
-    word, so it rises with repetition. It is asymptotically independent of document
-    length, which is why it is here and raw TTR is not.
+    word, so it rises with repetition. It is *asymptotically* independent of document
+    length; at real document lengths it is not (rho -0.48 with log length on the human
+    baseline), so fusion normalises it within length strata like everything else.
     """
     n = len(words)
     if n < 2:
@@ -190,7 +198,7 @@ def lexical_profile(doc: Document, view: TextView) -> List[Signal]:
             value=normalized_h,
             family=FAMILY_DISTRIBUTIONAL,
             direction=-1,
-            description="Unigram entropy divided by log2(vocabulary). Length-corrected; lower means more concentrated word use.",
+            description="Unigram entropy divided by log2(vocabulary). Lower means more concentrated word use.",
         ),
         Signal(
             name="hapax_ratio",
@@ -204,7 +212,7 @@ def lexical_profile(doc: Document, view: TextView) -> List[Signal]:
             value=yules_k(words),
             family=FAMILY_DISTRIBUTIONAL,
             direction=1,
-            description="Yule's K: length-independent repetition. Higher means more word reuse.",
+            description="Yule's K: the chance two random words are the same word. Higher means more word reuse.",
         ),
     ]
 

@@ -34,6 +34,10 @@ Repository = "https://github.com/Ark07Yad/synthetic-corpus-audit"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+# Fusion thresholds learned on the human baseline (numbers only, no baseline text).
+chaff = ["calibration.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
