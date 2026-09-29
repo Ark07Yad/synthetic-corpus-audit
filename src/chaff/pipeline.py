@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import time
+from array import array
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -57,6 +58,7 @@ class DocProfile:
     analysable: bool
     label: Optional[str] = None
     signals: List[Signal] = field(default_factory=list)
+    group: Optional[str] = None
 
     def to_row(self) -> Dict[str, Any]:
         row: Dict[str, Any] = {
@@ -207,6 +209,7 @@ def profile_corpus(
     on_row: Optional[Any] = None,
     reference: Optional[str] = None,
     context: Optional[CorpusContext] = None,
+    group_field: Optional[str] = None,
 ) -> CorpusProfile:
     """Stream a corpus and profile every document in it.
 
@@ -252,8 +255,9 @@ def profile_corpus(
     profile.metrics_active = [name for name, _ in active]
 
     vocabulary: "Counter[str]" = Counter()
-    lengths: List[float] = []
-    type_counts: List[float] = []
+    # Typed arrays, not lists of floats: 8 bytes per document instead of ~32.
+    lengths = array("d")
+    type_counts = array("d")
     measure_coverage = (context is not None and context.lm is not None
                         and context.source == SOURCE_REFERENCE)
     hits = positions = 0
@@ -263,6 +267,9 @@ def profile_corpus(
     ):
         view = build_view(doc.text)
         row = profile_document(doc, families=families, view=view, bound=bound)
+        if group_field is not None:
+            value = doc.meta.get(group_field)
+            row.group = None if value is None else str(value)
 
         profile.n_documents += 1
         profile.n_words += view.n_words
@@ -348,6 +355,7 @@ def collect_rows(
     min_chars: int = 0,
     context: Optional[CorpusContext] = None,
     reference: Optional[str] = None,
+    group_field: Optional[str] = None,
 ) -> "tuple":
     """Profile a corpus, streaming one :class:`Row` per document to ``spill``.
 
@@ -360,13 +368,14 @@ def collect_rows(
     def keep(doc: DocProfile) -> None:
         spill.write(Row(doc_id=doc.doc_id, n_words=doc.n_words, analysable=doc.analysable,
                         signals={s.name: s.value for s in doc.signals},
-                        label=doc.label).to_json() + "\n")
+                        label=doc.label, group=doc.group).to_json() + "\n")
         for s in doc.signals:
             if s.name not in catalog:
                 catalog[s.name] = SignalInfo(s.family, s.direction, s.description)
 
     profile = profile_corpus(path, text_field=text_field, limit=limit, min_chars=min_chars,
-                             on_row=keep, row_cap=0, context=context, reference=reference)
+                             on_row=keep, row_cap=0, context=context, reference=reference,
+                             group_field=group_field)
     return profile, catalog
 
 
@@ -415,6 +424,7 @@ def score_corpus(
     calibration: Optional[Calibration] = None,
     scores_path: Optional[str] = None,
     top_n: int = DEFAULT_TOP_N,
+    stratify_by: Optional[str] = None,
 ) -> ScoreRun:
     """Profile, fuse and tier every document in a corpus."""
     started = time.time()
@@ -432,24 +442,32 @@ def score_corpus(
             self_context = CorpusContext(source=SOURCE_SELF, n_documents=ref_context.n_documents,
                                          lm=ref_context.lm)
             with open(reference_rows, "w", encoding="utf-8") as fh:
-                _, ref_catalog = collect_rows(reference, fh, text_field=text_field, context=self_context)
+                _, ref_catalog = collect_rows(reference, fh, text_field=text_field, context=self_context,
+                                              group_field=stratify_by)
             with open(audited_rows, "w", encoding="utf-8") as fh:
                 profile, catalog = collect_rows(path, fh, text_field=text_field, limit=limit,
-                                                min_chars=min_chars, context=ref_context)
+                                                min_chars=min_chars, context=ref_context,
+                                                group_field=stratify_by)
             catalog = dict(ref_catalog, **catalog)
             stats_source = reference_rows
         else:
             with open(audited_rows, "w", encoding="utf-8") as fh:
                 profile, catalog = collect_rows(path, fh, text_field=text_field, limit=limit,
-                                                min_chars=min_chars)
+                                                min_chars=min_chars, group_field=stratify_by)
             stats_source = audited_rows
 
-        stats = build_reference_stats(_read_rows(stats_source), catalog)
+        stats = build_reference_stats(_read_rows(stats_source), catalog, stratify=stratify_by is not None)
+        if stratify_by is not None:
+            groups = sorted({k[0] for k in stats if isinstance(k, tuple)})
+            notes.append("normalised within groups of '{0}': {1}{2}".format(
+                stratify_by, ", ".join(groups[:12]) or "none large enough",
+                " (+{0} more)".format(len(groups) - 12) if len(groups) > 12 else "")
+                + "; groups under {0} documents use corpus-wide stats".format(50))
         dropped, coverage_note = coverage_drops(profile)
         notes.extend(profile.notes)
         if coverage_note:
             notes.append(coverage_note)
-        reference_n = max((s.n for s in stats.values()), default=0)
+        reference_n = max((s.n for k, s in stats.items() if not isinstance(k, tuple)), default=0)
         if reference_n < 50:
             notes.append(
                 "only {0} scoreable documents in the normalisation reference: corpus-relative "
@@ -493,7 +511,8 @@ def score_corpus(
         "chaff_version": _version(),
         "corpus": path,
         "reference": reference,
-        "normalisation": "reference corpus" if reference else "audited corpus (corpus-relative)",
+        "normalisation": ("reference corpus" if reference else "audited corpus (corpus-relative)")
+                         + (", stratified by '{0}'".format(stratify_by) if stratify_by else ""),
         "documents": profile.n_documents,
         "scored": scored_total,
         "tiers": tier_counts,

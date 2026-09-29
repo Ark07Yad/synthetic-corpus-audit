@@ -57,7 +57,11 @@ def _spearman(xs, ys):
 def _calibration(thresholds=None, null=None):
     human = HumanReference.from_values({"echo": [0.0] * 97 + [0.4, 0.6, 0.9],
                                         "noise": [0.0] * 60 + [2.0] * 40})
-    null = null or {f: sorted(random.Random(1).gauss(0, 1) for _ in range(201))
+    # One generator for all draws. The original built a new Random(1) per draw, so every
+    # null was 201 copies of one number — invisible under one-sided scoring, and exposed
+    # the moment two-sided scoring put every document in an extreme tail.
+    rng_null = random.Random(1)
+    null = null or {f: sorted(rng_null.gauss(0, 1) for _ in range(201))
                     for f in ("distributional", "surprisal", "reasoning", "artifact")}
     rng = random.Random(2)
     # Fisher's X under an independent null is chi-squared with 8 degrees of freedom.
@@ -255,8 +259,50 @@ def test_score_is_none_without_a_calibrated_score_null():
 
 def test_evidence_is_sorted_strongest_first():
     doc = score_row(_row(dist_a=-100.0, dist_b=5.0, surp=8.0), CATALOG, _stats(), _calibration())
-    zs = [e.z for e in doc.evidence]
-    assert zs == sorted(zs, reverse=True)
+    strengths = [e.strength for e in doc.evidence]
+    assert strengths == sorted(strengths, reverse=True)
+
+
+def test_two_sided_families_fire_in_either_direction():
+    """Phase 6: modern models write *more* diverse text than human genre norms, the
+    opposite of the original hypothesis. A continuous family must flag both extremes."""
+    stats = _stats()
+    cal = _calibration()
+    cal.thresholds_low = {"distributional": -2.0, "surprisal": -2.0, "reasoning": -2.0}
+    too_compressed = score_row(_row(dist_a=-100.0), CATALOG, stats, cal).families["distributional"]
+    too_diverse = score_row(_row(dist_a=100.0), CATALOG, stats, cal).families["distributional"]
+    assert (too_compressed.fired, too_compressed.side) == (True, "high")
+    assert (too_diverse.fired, too_diverse.side) == (True, "low")
+
+
+def test_a_too_diverse_document_scores_as_atypical():
+    """What SIDEDNESS actually controls is the score: a document at the *opposite*
+    extreme from the original hypothesis (richer, less repetitive than its genre) must
+    score as strong evidence. One-sided scoring gave it the lowest score possible."""
+    stats, cal = _stats(), _calibration()
+    typical = score_row(_row(dist_a=5.0, dist_b=5.0, surp=8.0, reas=0.7), CATALOG, stats, cal)
+    too_diverse = score_row(_row(dist_a=100.0, dist_b=-100.0, surp=8.0, reas=0.7), CATALOG, stats, cal)
+    assert too_diverse.families["distributional"].z < -3
+    assert too_diverse.score > typical.score + 20
+
+
+def test_evidence_in_the_unexpected_direction_ranks_first():
+    doc = score_row(_row(dist_a=100.0, dist_b=5.0, surp=8.0), CATALOG, _stats(), _calibration())
+    assert doc.evidence[0].signal == "dist_a" and doc.evidence[0].z < -3
+
+
+def test_artifact_family_stays_one_sided():
+    """A tell only means something in one direction: an unusually *low* hedging rate is
+    not evidence of anything."""
+    cal = _calibration()
+    cal.thresholds_low = {"distributional": -2.0}
+    doc = score_row(_row(noise=50.0), CATALOG, _stats(), cal)   # lots of human noise
+    assert not doc.families["artifact"].fired
+
+
+def test_evidence_records_which_way_a_signal_deviates():
+    doc = score_row(_row(dist_a=-100.0), CATALOG, _stats(), _calibration())
+    assert {e.signal: e.deviation for e in doc.evidence}["dist_a"] == "below"
 
 
 def test_labels_never_affect_scoring():
@@ -266,3 +312,37 @@ def test_labels_never_affect_scoring():
     results = [score_row(Row("d", 500, True, dict(signals), label=label), CATALOG, stats, cal)
                for label in ("human", "synthetic", None)]
     assert len({(r.tier, r.score) for r in results}) == 1
+
+
+# ------------------------------------------------------- phase 6: stratify-by
+
+def _grouped_rows():
+    rng = random.Random(4)
+    rows = []
+    for i in range(300):          # majority genre: dist_a around 5
+        rows.append(Row(str(i), 500, True, {"dist_a": rng.gauss(5, 1)}, group="major"))
+    for i in range(60):           # minority genre: dist_a around 9
+        rows.append(Row("m%d" % i, 500, True, {"dist_a": rng.gauss(9, 1)}, group="minor"))
+    for i in range(10):           # too small to stand alone
+        rows.append(Row("t%d" % i, 500, True, {"dist_a": rng.gauss(9, 1)}, group="tiny"))
+    return rows
+
+
+def test_stratified_stats_keep_a_group_entry_only_when_it_is_large_enough():
+    from chaff.scoring import stats_for
+    stats = build_reference_stats(_grouped_rows(), CATALOG, stratify=True)
+    assert ("major", "dist_a") in stats and ("minor", "dist_a") in stats
+    assert ("tiny", "dist_a") not in stats
+    assert stats_for(stats, "dist_a", "tiny") is stats["dist_a"]    # falls back to corpus-wide
+
+
+def test_stratifying_removes_the_minority_genre_penalty():
+    """The minority genre is unusual only relative to the majority: normalised within its
+    own group, a typical minority document is typical."""
+    cal = _calibration()
+    plain = build_reference_stats(_grouped_rows(), CATALOG)
+    strat = build_reference_stats(_grouped_rows(), CATALOG, stratify=True)
+    doc = Row("x", 500, True, {"dist_a": 9.0}, group="minor")
+    z_plain = normalise(doc.signals, 500, CATALOG, plain, cal, group=doc.group)[0].z
+    z_strat = normalise(doc.signals, 500, CATALOG, strat, cal, group=doc.group)[0].z
+    assert abs(z_plain) > 2 and abs(z_strat) < 0.5

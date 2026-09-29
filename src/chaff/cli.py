@@ -83,6 +83,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_score.add_argument("--top", type=int, default=10, help="documents to list (default: 10)")
     p_score.add_argument("--calibration", default=None, metavar="PATH",
                          help="use this calibration file instead of the shipped one")
+    p_score.add_argument("--stratify-by", default=None, metavar="FIELD",
+                         help="normalise each document against others with the same value of this "
+                              "record field (e.g. source, domain, genre): removes the penalty "
+                              "corpus-relative scoring puts on minority genres"),
 
     p_explain = sub.add_parser("explain", help="why one document got its tier")
     p_explain.add_argument("scores", help="scores file written by 'chaff score --out'")
@@ -258,7 +262,7 @@ def cmd_score(args: argparse.Namespace) -> int:
     run = score_corpus(
         args.corpus, text_field=args.text_field, limit=args.limit, min_chars=args.min_chars,
         reference=args.reference, calibration=load_calibration(args.calibration),
-        scores_path=args.out, top_n=max(args.top, 25),
+        scores_path=args.out, top_n=max(args.top, 25), stratify_by=args.stratify_by,
     )
     meta = run.meta
     if meta["documents"] == 0:
@@ -319,19 +323,24 @@ def cmd_explain(args: argparse.Namespace) -> int:
     if found["score"] is None:
         print("          too short to analyse ({0} words); nothing was scored".format(found["n_words"]))
         return 0
-    print("score     {0:.1f} / 100   (mean human-null percentile of its two strongest families)".format(found["score"]))
+    print("score     {0:.1f} / 100   (combined evidence, as a percentile among clean human documents)".format(found["score"]))
     if "label" in found:
         print("label     {0}   (ground truth; never read by scoring)".format(found["label"]))
-    print("\nfamily           z        threshold  fired  human percentile  signals")
-    for fam, r in sorted(found["families"].items(), key=lambda kv: -(kv[1]["z"] or 0)):
-        print("  {0:<14} {1:+7.2f}   {2:>8}   {3:<5}  {4:>15}   {5}".format(
-            fam, r["z"], "-" if r["threshold"] is None else "{0:+.2f}".format(r["threshold"]),
-            "yes" if r["fired"] else "no",
+    print("\nfamily              z    fires if outside     fired        human percentile  signals")
+    for fam, r in sorted(found["families"].items(), key=lambda kv: -abs(kv[1]["z"] or 0)):
+        low = r.get("threshold_low")
+        bounds = ("({0:+.2f}, {1:+.2f})".format(low, r["threshold"]) if low is not None
+                  else "(-inf, {0:+.2f})".format(r["threshold"]) if r["threshold"] is not None else "-")
+        fired = "yes ({0})".format(r.get("side")) if r["fired"] else "no"
+        print("  {0:<14} {1:+7.2f}   {2:<18}  {3:<11}  {4:>15}   {5}".format(
+            fam, r["z"], bounds, fired,
             "-" if r["percentile"] is None else "{0:.1%}".format(r["percentile"]), r["n_signals"]))
-    print("\nstrongest evidence (z > 0 points toward synthetic)")
+    print("\nstrongest evidence (distributional, surprisal and reasoning count in either direction;")
+    print("artifact signals only when high)")
     for e in found["evidence"]:
-        print("  {0:+6.2f}  {1:<26} = {2:<10.4g} [{3}, vs {4}]".format(
-            e["z"], e["signal"], e["value"], e["family"], e["basis"]))
+        dev = {"above": "above typical", "below": "below typical"}.get(e.get("deviation", ""), "")
+        print("  {0:+6.2f}  {1:<26} = {2:<10.4g} {3:<14} [{4}, vs {5}]".format(
+            e["z"], e["signal"], e["value"], dev, e["family"], e["basis"]))
         print("          {0}".format(e["description"]))
     return 0
 

@@ -73,13 +73,18 @@ def test_r4_audited_coverage_gates_spread_signals(coverage, dropped):
 
 def test_sample_corpus_tiers(tmp_path):
     """Mechanism, not accuracy: ten hand-written documents. The adversarial human cases
-    must stay CLEAN and the looping reasoning document must corroborate."""
+    must stay CLEAN, no human document may reach LIKELY_SYNTHETIC, and the looping
+    reasoning document must corroborate.
+
+    Under two-sided scoring (phase 6) the casual forum post can be SUSPECT: every
+    sentence brings new content, which is atypical next to formal writing. That is a
+    known cost, stated in the README, and why "all humans CLEAN" is no longer asserted."""
     out = os.path.join(str(tmp_path), "s.jsonl")
     score_corpus(SAMPLE, scores_path=out)
     tiers = {r["doc_id"]: r["tier"] for r in map(json.loads, open(out))}
     assert tiers["h_changelog_01"] == tiers["h_legal_01"] == "CLEAN"
     assert tiers["s_reasoning_01"] == "LIKELY_SYNTHETIC"
-    assert all(t == "CLEAN" for d, t in tiers.items() if d.startswith("h_"))
+    assert not any(t == "LIKELY_SYNTHETIC" for d, t in tiers.items() if d.startswith("h_"))
 
 
 def test_cli_score_explain_report_round_trip(tmp_path, capsys):
@@ -112,3 +117,16 @@ def test_every_report_carries_its_caveats(tmp_path):
     top = [d.to_dict() for d in run.top]
     for text in (render_markdown(run.meta, top), render_json(run.meta, top), render_html(run.meta, top)):
         assert "triage instrument" in text and "True-positive rates are not yet measured" in text
+
+
+def test_stratify_by_is_reported_and_groups_are_named(tmp_path):
+    path = os.path.join(str(tmp_path), "g.jsonl")
+    rng = random.Random(9)
+    vocab = "the a of cat dog ran sat fast slow red blue green tree house river stone".split()
+    with open(path, "w", encoding="utf-8") as fh:
+        for i in range(120):
+            text = ". ".join(" ".join(rng.choice(vocab) for _ in range(12)) for _ in range(8)) + "."
+            fh.write(json.dumps({"id": str(i), "text": text, "genre": "a" if i < 60 else "b"}) + "\n")
+    run = score_corpus(path, stratify_by="genre")
+    assert "stratified by 'genre'" in run.meta["normalisation"]
+    assert any("groups of 'genre': a, b" in n for n in run.meta["notes"])

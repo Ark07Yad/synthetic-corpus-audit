@@ -31,6 +31,17 @@ The four steps
    includes whatever dependence the families really have (R6) — not on an independence
    assumption that phase 4 showed is false.
 
+**Two-sided since phase 6.** Distributional, surprisal and reasoning families flag a
+document that is atypical for its genre in *either* direction; only the artifact family is
+one-sided. The project began from a one-sided premise — synthetic text has a compressed,
+repetitive vocabulary — and evaluation on real model output showed that holds weakly for
+older base models and is **inverted** for modern instruction-tuned ones, which write with
+*richer* vocabulary than the human text of the same genre (per-signal AUC as low as 0.12
+on Claude-written technical documentation, 0.20 on GPT-4). One-sided scoring ranked
+Claude's technical docs as more human than human docs (AUC 0.06). Two-sided scoring,
+pre-registered and confirmed on 1,442 MAGE documents no analysis had touched, took AUC
+from 0.61 to 0.88 there. See ``benchmarks/EVALUATION.md``.
+
 4. **Tier and score.** Two or more families firing is ``LIKELY_SYNTHETIC``, one is
    ``SUSPECT``, none is ``CLEAN`` (OBJECTIVE §4.3) — corroboration is the *tier's* job.
    The 0-100 score ranks combined evidence strength: Fisher's method over families,
@@ -62,6 +73,7 @@ from __future__ import annotations
 import bisect
 import json
 import math
+from array import array
 from dataclasses import asdict, dataclass, field
 from statistics import NormalDist
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -113,6 +125,19 @@ AGGREGATION = {
     FAMILY_ARTIFACT: "any",
 }
 
+#: Which tails of a family's null count as evidence. Artifact signals are tells, which
+#: only mean something in one direction. The other families measure how typical a
+#: document's distribution is, and phase 6 found synthetic text deviating both ways
+#: depending on the generator (see the module docstring).
+SIDE_ONE = "one-sided"
+SIDE_TWO = "two-sided"
+SIDEDNESS = {
+    FAMILY_DISTRIBUTIONAL: SIDE_TWO,
+    FAMILY_SURPRISAL: SIDE_TWO,
+    FAMILY_REASONING: SIDE_TWO,
+    FAMILY_ARTIFACT: SIDE_ONE,
+}
+
 _NORMAL = NormalDist()
 _P_FLOOR = 1e-12
 
@@ -151,6 +176,9 @@ class Row:
     analysable: bool
     signals: Dict[str, float]
     label: Optional[str] = None
+    #: Stratification group (``--stratify-by``): documents are normalised against
+    #: others in the same group. ``None`` when not stratifying.
+    group: Optional[str] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True)
@@ -186,40 +214,92 @@ def build_signal_stats(pairs: Sequence[Tuple[int, float]]) -> Optional[SignalSta
     """Stats from ``(n_words, value)`` pairs, or ``None`` if there are none."""
     if not pairs:
         return None
-    ordered = sorted(pairs, key=lambda p: p[0])
-    n = len(ordered)
+    lengths = array("i", (p[0] for p in pairs))
+    values = array("d", (p[1] for p in pairs))
+    return _stats_from_columns(lengths, values)
+
+
+def _stats_from_columns(lengths: "array", values: "array") -> Optional[SignalStats]:
+    """Stats from parallel typed columns.
+
+    Columns rather than tuples because this is fusion's memory high-water mark: a
+    ``(n_words, value)`` tuple costs ~100 bytes against ~12 in two typed arrays, which
+    is the difference between ~2.4 GB and ~0.3 GB of reference stats per million
+    documents at ~24 signals. The sort permutation is built for one signal at a time,
+    so it never exists for all signals at once.
+    """
+    n = len(values)
+    if n == 0:
+        return None
+    order = sorted(range(n), key=lengths.__getitem__)
     n_bins = max(1, min(MAX_BINS, n // MIN_BIN))
     edges, medians, mads = [], [], []
     for b in range(n_bins):
-        chunk = ordered[b * n // n_bins:(b + 1) * n // n_bins]
-        values = [v for _, v in chunk]
-        edges.append(chunk[-1][0])
-        medians.append(median(values))
-        mads.append(mad(values))
-    values = [v for _, v in ordered]
+        idx = order[b * n // n_bins:(b + 1) * n // n_bins]
+        chunk = [values[i] for i in idx]
+        edges.append(lengths[idx[-1]])
+        medians.append(median(chunk))
+        mads.append(mad(chunk))
     return SignalStats(edges=edges, medians=medians, mads=mads,
                        global_median=median(values), global_mad=mad(values), n=n)
+
+
+#: Key of the corpus-wide statistics in a stratified stats table.
+ALL_GROUPS = None
 
 
 def build_reference_stats(
     rows: Iterable[Row],
     catalog: Mapping[str, SignalInfo],
-) -> Dict[str, SignalStats]:
-    """Stats for every corpus-normalised signal, from a stream of reference rows."""
-    pairs: Dict[str, List[Tuple[int, float]]] = {}
+    stratify: bool = False,
+) -> Dict[Any, SignalStats]:
+    """Stats for every corpus-normalised signal, from a stream of reference rows.
+
+    Unstratified, keys are signal names. Stratified (``--stratify-by``), keys are also
+    ``(group, signal)`` pairs, alongside the corpus-wide entries — a group with fewer
+    than :data:`MIN_BIN` documents for a signal gets no entry of its own and falls back
+    to corpus-wide stats in :func:`stats_for`.
+
+    Why stratify at all: corpus-relative normalisation makes the corpus majority the
+    definition of normal. On the human baseline the distributional family fired on 6.1%
+    of the minority genre against 1.8% of the majority. If documents carry a genre or
+    source field, normalising within it removes that penalty.
+    """
+    columns: Dict[Any, Tuple["array", "array"]] = {}
+
+    def push(key, n_words, value):
+        if key not in columns:
+            columns[key] = (array("i"), array("d"))
+        columns[key][0].append(n_words)
+        columns[key][1].append(value)
+
     for row in rows:
         if not row.analysable:
             continue
         for name, value in row.signals.items():
             info = catalog.get(name)
             if info and NORMALISATION.get(info.family) == BASIS_CORPUS:
-                pairs.setdefault(name, []).append((row.n_words, value))
-    out = {}
-    for name, p in pairs.items():
-        stats = build_signal_stats(p)
+                push(name, row.n_words, value)
+                if stratify and row.group is not None:
+                    push((row.group, name), row.n_words, value)
+    out: Dict[Any, SignalStats] = {}
+    for key in list(columns):
+        lengths, values = columns.pop(key)   # release each column once summarised
+        if isinstance(key, tuple) and len(values) < MIN_BIN:
+            continue                          # too small to stand alone: fall back
+        stats = _stats_from_columns(lengths, values)
         if stats is not None:
-            out[name] = stats
+            out[key] = stats
     return out
+
+
+def stats_for(stats: Mapping[Any, SignalStats], name: str, group: Optional[str]) -> Optional[SignalStats]:
+    """The group's own stats for a signal when it has them, else corpus-wide."""
+    if group is not None:
+        own = stats.get((group, name))
+        if own is not None:
+            return own
+    return stats.get(name)
 
 
 # ------------------------------------------------ artifacts: human baseline
@@ -271,6 +351,8 @@ class Calibration:
     human: HumanReference
     signals: List[str] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
+    #: Lower thresholds, for two-sided families only: fire when z falls strictly below.
+    thresholds_low: Dict[str, float] = field(default_factory=dict)
     #: Null distribution (quantiles) of the evidence statistic on clean documents.
     score_null: List[float] = field(default_factory=list)
 
@@ -297,17 +379,29 @@ class Calibration:
     def statistic(self, percentiles: Mapping[str, Optional[float]]) -> float:
         return evidence_statistic(percentiles, {f: len(v) for f, v in self.family_null.items()})
 
+    def fires(self, family: str, z: float) -> Optional[str]:
+        """``"high"`` or ``"low"`` if ``z`` passes the family's threshold, else ``None``.
+        Strict comparisons: see :data:`CALIBRATION_PRECISION` and PROJECT D27."""
+        high = self.thresholds.get(family)
+        if high is not None and z > high:
+            return "high"
+        low = self.thresholds_low.get(family)
+        if low is not None and z < low:
+            return "low"
+        return None
+
     def to_dict(self) -> Dict[str, Any]:
         return {"thresholds": self.thresholds, "family_null": self.family_null,
                 "human": self.human.counts, "signals": self.signals, "meta": self.meta,
-                "score_null": self.score_null}
+                "score_null": self.score_null, "thresholds_low": self.thresholds_low}
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Calibration":
         human = HumanReference(counts={k: [tuple(p) for p in v] for k, v in data["human"].items()})
         return cls(thresholds=dict(data["thresholds"]), family_null=dict(data["family_null"]),
                    human=human, signals=list(data.get("signals", [])), meta=dict(data.get("meta", {})),
-                   score_null=list(data.get("score_null", [])))
+                   score_null=list(data.get("score_null", [])),
+                   thresholds_low=dict(data.get("thresholds_low", {})))
 
 
 def _mid_rank(sorted_values: Sequence[float], x: float) -> float:
@@ -327,9 +421,10 @@ _FISHER_MISSING = 2.0
 def evidence_statistic(percentiles: Mapping[str, Optional[float]], null_sizes: Mapping[str, int]) -> float:
     """Fisher's combined evidence over the four families.
 
-    ``tail = 1 - percentile`` is each family's upper-tail probability under the human
-    null, floored at half a quantile step so a family beyond every null value is very
-    strong rather than infinite.
+    Each family contributes ``-2 ln(tail)``, where ``tail`` is its probability under the
+    human null: upper tail ``1 - p`` for one-sided families, ``2 * min(p, 1 - p)`` for
+    two-sided ones. Floored at half a quantile step, so a family beyond every null value
+    is very strong rather than infinite.
     """
     x = 0.0
     for family in FAMILIES:
@@ -338,7 +433,8 @@ def evidence_statistic(percentiles: Mapping[str, Optional[float]], null_sizes: M
             x += _FISHER_MISSING
             continue
         floor = 0.5 / max(1, null_sizes.get(family, 1))
-        x += -2.0 * math.log(max(1.0 - p, floor))
+        tail = 2.0 * min(p, 1.0 - p) if SIDEDNESS.get(family) == SIDE_TWO else 1.0 - p
+        x += -2.0 * math.log(max(tail, floor))
     return x
 
 
@@ -363,6 +459,14 @@ class Evidence:
     z: float
     basis: str
     description: str = ""
+    #: "above" / "below" the typical value for comparable documents (raw, not oriented).
+    deviation: str = ""
+
+    @property
+    def strength(self) -> float:
+        """How much this signal contributes as evidence: ``|z|`` for two-sided families,
+        where either direction counts; ``z`` for one-sided ones."""
+        return abs(self.z) if SIDEDNESS.get(self.family) == SIDE_TWO else self.z
 
 
 @dataclass
@@ -372,6 +476,10 @@ class FamilyResult:
     fired: bool
     threshold: Optional[float]
     percentile: Optional[float]
+    #: Which tail fired ("high" = the originally hypothesised synthetic direction,
+    #: "low" = the opposite extreme), or None.
+    side: Optional[str] = None
+    threshold_low: Optional[float] = None
 
 
 @dataclass
@@ -396,11 +504,13 @@ class ScoredDoc:
             "n_words": self.n_words,
             "families_fired": self.fired,
             "families": {f: {"z": None if r.z is None else round(r.z, 4), "n_signals": r.n_signals,
-                             "fired": r.fired, "threshold": r.threshold,
+                             "fired": r.fired, "side": r.side, "threshold": r.threshold,
+                             "threshold_low": r.threshold_low,
                              "percentile": None if r.percentile is None else round(r.percentile, 4)}
                          for f, r in self.families.items()},
             "evidence": [{"signal": e.signal, "family": e.family, "value": round(e.value, 6),
-                          "z": round(e.z, 3), "basis": e.basis, "description": e.description}
+                          "z": round(e.z, 3), "strength": round(e.strength, 3),
+                          "deviation": e.deviation, "basis": e.basis, "description": e.description}
                          for e in self.evidence[:max_evidence]],
             **({"label": self.label} if self.label is not None else {}),
         }
@@ -412,9 +522,10 @@ def normalise(
     signals: Mapping[str, float],
     n_words: int,
     catalog: Mapping[str, SignalInfo],
-    stats: Mapping[str, SignalStats],
+    stats: Mapping[Any, SignalStats],
     calibration: Calibration,
     dropped: Iterable[str] = (),
+    group: Optional[str] = None,
 ) -> List[Evidence]:
     """Step 1: every present signal as an oriented, clipped z."""
     dropped = set(dropped)
@@ -430,15 +541,17 @@ def normalise(
                 continue
             z = _z_from_tail(p)
         else:
-            s = stats.get(name)
+            s = stats_for(stats, name, group)
             if s is None:
                 continue
             location, scale = s.locate(n_words)
             if scale <= 0:
                 continue  # degenerate everywhere: no information, not a zero-evidence vote
             z = _clip(info.direction * (value - location) / scale)
+        raw = z * info.direction
         out.append(Evidence(signal=name, family=info.family, value=value, z=z,
-                            basis=basis, description=info.description))
+                            basis=basis, description=info.description,
+                            deviation="above" if raw > 0 else "below" if raw < 0 else ""))
     return out
 
 
@@ -472,19 +585,17 @@ def score_row(
         return ScoredDoc(doc_id=row.doc_id, tier=TIER_UNSCORED, score=None, n_words=row.n_words,
                          families={}, evidence=[], label=row.label)
 
-    evidence = normalise(row.signals, row.n_words, catalog, stats, calibration, dropped)
+    evidence = normalise(row.signals, row.n_words, catalog, stats, calibration, dropped, row.group)
     families: Dict[str, FamilyResult] = {}
     for family, (z, n) in aggregate(evidence).items():
         z = round(z, CALIBRATION_PRECISION)
-        threshold = calibration.thresholds.get(family)
+        # Strict comparisons (Calibration.fires): artifact family scores are heavily tied,
+        # and a threshold landing on a tie would otherwise fire on every tied document.
+        side = calibration.fires(family, z)
         families[family] = FamilyResult(
-            z=z, n_signals=n,
-            # Strictly greater: artifact family scores are heavily tied (most clean
-            # documents share the all-zero value), and a threshold that lands on a tie
-            # would otherwise fire on every tied document at once. With ">" a clean
-            # document fires with probability at most alpha, whatever the ties.
-            fired=threshold is not None and z > threshold,
-            threshold=threshold,
+            z=z, n_signals=n, fired=side is not None, side=side,
+            threshold=calibration.thresholds.get(family),
+            threshold_low=calibration.thresholds_low.get(family),
             percentile=calibration.percentile(family, z),
         )
 
@@ -493,6 +604,6 @@ def score_row(
 
     score = calibration.score(calibration.statistic({f: r.percentile for f, r in families.items()}))
 
-    evidence.sort(key=lambda e: e.z, reverse=True)
+    evidence.sort(key=lambda e: e.strength, reverse=True)
     return ScoredDoc(doc_id=row.doc_id, tier=tier, score=score, n_words=row.n_words,
                      families=families, evidence=evidence, label=row.label)

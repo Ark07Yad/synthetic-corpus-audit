@@ -6,9 +6,9 @@ Find AI-generated text in a pre-training corpus *before* it poisons your tokeniz
 
 [![ci](https://github.com/Ark07Yad/synthetic-corpus-audit/actions/workflows/ci.yml/badge.svg)](https://github.com/Ark07Yad/synthetic-corpus-audit/actions/workflows/ci.yml)
 ![python](https://img.shields.io/badge/python-3.9%2B-blue)
-![tests](https://img.shields.io/badge/tests-203-brightgreen)
+![tests](https://img.shields.io/badge/tests-212-brightgreen)
 ![dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)
-![status](https://img.shields.io/badge/status-phase%205%20of%206-orange)
+![status](https://img.shields.io/badge/status-evaluated-blue)
 
 ---
 
@@ -28,19 +28,49 @@ The damage is done **before** anyone trains anything — it is baked into the co
 it is cheapest to remove while it is still a file: after tokenization it is opaque
 integer IDs, and after pre-training it is model weights.
 
+## Results, up front
+
+Evaluated on three independent sources of model-written text, each against human text of
+the same kind (full report: [`benchmarks/EVALUATION.md`](benchmarks/EVALUATION.md)):
+
+| Model-written text | Flagged | False positives (human) | AUC |
+|---|---|---|---|
+| Older open-weight models: BLOOM, GPT-J/NeoX, FLAN-T5, OPT, GLM (MAGE) | **84–100%** | 18–22% flagged, ~2% `LIKELY` | 0.92–0.99 |
+| LLaMA-1, 7–65B (MAGE) | 65–68% | same | 0.88 |
+| OpenAI GPT-3.5 / davinci / GPT-4 (MAGE) | **30–40%** | same | 0.61–0.64 |
+| Claude, technical documentation (blind-written) | **19%** | 9% | 0.78 |
+
+These figures are for the recommended mode, `--reference` with a genre-matched human
+corpus. On 1,442 MAGE documents held back from every analysis: **AUC 0.87**, 72.8%
+flagged at an 18.1% false-positive rate, 42.2% `LIKELY_SYNTHETIC` at 2.3%.
+
+**What that means.** chaff is a useful triage tool for contamination by older and
+open-weight models and for heavily templated synthetic text. It is **not** a reliable
+detector of frontier-model output. False-positive rates depend on genre (11–38%
+flagged, 0–5% `LIKELY`), and changelogs and licence boilerplate are the characteristic
+human false positives.
+
+**The finding that changed the design.** chaff was built on the premise that synthetic
+text has a compressed, repetitive vocabulary. That holds for older models. Modern
+instruction-tuned models write with *richer* vocabulary than the human text of the same
+genre. The original one-sided scoring ranked Claude's technical docs as **more human than
+human docs** (AUC 0.04). chaff now flags documents that are atypical for their genre *in
+either direction*. That change was pre-registered and confirmed on held-out data, where
+it took AUC from 0.61 to 0.87.
+
 ## Why this is not just a quality filter
 
 Standard pre-training filters catch **low-quality** text: gibberish, spam, boilerplate,
 bad language ID. Synthetic text is not low-quality. It is grammatical, on-topic and
-clean. It is **low-entropy**. Different failure mode, different detector.
+clean. It is **atypical**, in a direction that depends on the generator. Different
+failure mode, different detector.
 
-| | Low-quality text | Synthetic text |
+| | Low-quality text | Synthetic text (as measured) |
 |---|---|---|
 | Grammatical | often not | yes |
 | On-topic | often not | yes |
-| Caught by perplexity cutoffs | yes | **no — it scores *better* than human text** |
-| Lexical tail | intact | truncated by top-p/top-k sampling |
-| Surprisal over tokens | noisy | **flat** |
+| Caught by perplexity cutoffs | yes | no; it often scores *better* than human text |
+| Lexical tail | intact | truncated for older base models, **richer than human** for modern instruction-tuned ones |
 
 ## Install
 
@@ -59,7 +89,8 @@ droppable onto the data node that already holds your dump. CI enforces this.
 chaff score corpus.jsonl --out scores.jsonl --report report.html   # tier, score and evidence per document
 chaff explain scores.jsonl <doc_id>                                  # why one document got its tier
 chaff report scores.jsonl --format md                                # re-render the run as md / json / html
-chaff score crawl.jsonl --reference trusted.jsonl --out scores.jsonl # normalise against a trusted corpus
+chaff score crawl.jsonl --reference trusted.jsonl --out scores.jsonl # normalise against a trusted corpus (recommended)
+chaff score crawl.jsonl --stratify-by domain --out scores.jsonl      # normalise within each value of a record field
 
 chaff profile corpus.jsonl --out rows.jsonl  # raw signals per document, no scoring
 chaff inspect corpus.jsonl -n 5              # see individual docs as chaff sees them
@@ -109,9 +140,11 @@ Every number below was measured on held-out data that took no part in setting it
    look "normal".
 2. **Combine within each family.** Signals measuring the same property are averaged; the
    artifact family takes its strongest tell, corrected for having looked at six.
-3. **Tier.** Each family has a threshold calibrated on 877 human documents.
-   **Two or more families past their threshold → `LIKELY_SYNTHETIC`**; one → `SUSPECT`;
-   none → `CLEAN`. No single family, however strong, can produce `LIKELY_SYNTHETIC`.
+3. **Tier.** Each family has thresholds calibrated on 877 human documents. The
+   distributional, surprisal and reasoning families fire when a document is atypical for
+   its genre **in either direction**; the artifact family only when a tell is present.
+   **Two or more families firing → `LIKELY_SYNTHETIC`**; one → `SUSPECT`; none →
+   `CLEAN`. No single family, however strong, can produce `LIKELY_SYNTHETIC`.
 4. **Score 0–100** = the document's combined evidence (Fisher's method across families)
    as a **percentile among clean human documents**. 50 is typical human text; 99 means
    more evidence than 99% of it.
@@ -121,12 +154,16 @@ On 871 held-out human documents:
 | | Result |
 |---|---|
 | tiered `LIKELY_SYNTHETIC` | **0.92%** (target ≤ 1%) |
-| tiered `SUSPECT` | 8.15% |
-| median score / 95th percentile | 50.2 / 95.5 |
-| lowest score of any `SUSPECT` document | 61.2 (so tier and score agree) |
+| tiered `SUSPECT` | 6.66% |
+| median score / 95th percentile | 53.2 / 96.5 |
+| lowest score of any `SUSPECT` document | 80.1 (so tier and score agree) |
+
+That calibration is on technical reference text. On other genres the false-positive rate
+is higher (see Results above), so re-calibrate on a trusted corpus of your own genre
+before relying on the tiers.
 
 The corroboration rule rests on the families being independent, and they aren't fully:
-on clean text, two families fire together **2.6× more often** than independence would
+on clean text, two families fire together **3.6× more often** than independence would
 predict. Thresholds are calibrated on that *measured* joint rate, so the 0.92% already
 includes it. A tool that assumed independence would have understated its false-positive
 rate by that factor.
@@ -180,11 +217,13 @@ wrong in a specific way:
   spread signals above thresholds read off that experiment. `chaff profile` reports which
   side of the line your corpus is on.
 
-The toy language has no topic structure, so this doesn't settle whether *real* human text
-is bursty because of topic shifts. That's a phase 6 measurement on real data, not
-something assumed here.
+The toy language has no topic structure, so it couldn't settle whether *real* human text
+is bursty because of topic shifts. Phase 6 measured that on real data, and burstiness is
+**weak**: surprisal spread reached AUC 0.44 on Claude-written technical docs and 0.59 on
+MAGE. The level of surprisal did better where synthetic and human text share a domain
+(0.60 on MAGE, 0.70 on GPT-4).
 
-## Status: phase 5 of 6
+## Status: complete, and evaluated
 
 | Phase | Scope | State |
 |---|---|---|
@@ -193,33 +232,31 @@ something assumed here.
 | 3 | Surprisal family — two-pass pipeline, leave-one-out trigram LM, coverage-gated signals | **done** |
 | 4 | Artifact + reasoning families, false-positive benchmark on guaranteed-human text | **done** |
 | 5 | Fusion: length-stratified normalisation, calibrated tiers, Fisher score, `score` / `explain` / `report` | **done** |
-| 6 | Real-model-output evaluation corpus, published precision/recall, non-technical human baseline | next |
+| 6 | Evaluation on real model output (MAGE, 25 generators; blind Claude), two-sided scoring, `--stratify-by`, 100k-document scale run | **done** |
 
-chaff scores, tiers and explains every document. What it doesn't have yet is a measured
-**true-positive** rate.
+**Scale:** 100,000 documents (~25M tokens) scored end to end in 5.1 minutes at 2.2 GB peak
+memory, single-threaded, two passes over the corpus.
 
-Signals are implemented and unit-tested against controlled corpora with known
-properties: Zipfian distributions at known exponents, artificially truncated tails,
-nucleus-truncated sampling from a known language. Their false-positive behaviour is
-measured on 1,748 guaranteed-human documents. Their **true-positive** rates are not
-measured yet: that needs an independent corpus of real model output. On the 10-document
-sample corpus, scored against the human baseline as reference, 4 of 5 synthetic documents
-are flagged and 0 of 5 human ones; the fifth synthetic document was written to evade
-every detector and does. That demonstrates the mechanism, not an accuracy. The 10-document sample corpus averages 150 words, which is below
-the length at which most of these metrics carry information, and at 1,475 tokens it's
-far too small to train a language model. Building a long-document evaluation corpus is
-phase 6, and no accuracy claim will be made before then.
-
-Throughput, single-threaded pure Python: ~620k tokens/s building the model, ~170k
-tokens/s for the scoring pass with every family active.
+Every signal is unit-tested against controlled corpora with known properties, its
+false-positive behaviour is measured on 1,748 guaranteed-human documents, and its
+true-positive behaviour on MAGE and on blind Claude-written text
+([`benchmarks/EVALUATION.md`](benchmarks/EVALUATION.md)).
 
 ## Limitations, stated up front
 
-- **Corpus-relative scoring penalises minority genres.** A document is scored against
-  others *in the same corpus*, so a genre that's rare there looks unusual. On the
-  calibration baseline, the distributional family fired on 6.1% of the minority genre
-  (stdlib docstrings) against 1.8% of the majority (man pages). Use `--reference` with a
-  genre-matched trusted corpus when you have one.
+- **Weak on frontier models.** 30–40% of OpenAI GPT-3.5/GPT-4 output and 19% of
+  Claude-written technical docs are flagged. Don't use chaff as your only filter against
+  modern-model contamination.
+- **False positives depend on genre.** From 11% flagged (reference prose) to 38%
+  (science abstracts). Calibrate on a trusted human corpus of your own genre.
+- **Two-sided scoring has a cost.** Unusually *rich* human writing, such as a casual post
+  where every sentence brings new content, can be flagged `SUSPECT` when compared against
+  formal text.
+- **Corpus-relative scoring penalises minority genres and degrades under
+  contamination.** A genre that's rare in the corpus looks unusual, and at 50%
+  contamination the corpus-relative AUC falls to 0.30 while reference mode holds at 0.71.
+  Use `--reference` with a genre-matched trusted corpus, or `--stratify-by` a genre field
+  (it halved the minority-genre false positives on the baseline).
 - **This is a triage instrument, not an AI detector.** It ranks documents for review. It
   does not prove any individual document was machine-generated, and it never claims which
   model wrote it.
@@ -230,9 +267,10 @@ tokens/s for the scoring pass with every family active.
 - **Not for academic integrity.** Wrong granularity, and the false-positive cost falls on
   a person rather than on a row in a dataset. Please do not use it that way.
 - Single-document scores are noisy below ~50 words and are reported, not scored.
-- **Artifact false positives are measured on technical text only.** Literary and
-  journalistic writing uses words like "testament" and "bustling" legitimately, and that
-  rate is unmeasured until phase 6.
+- **Changelogs and licence boilerplate are the characteristic human false positives.**
+  7 of 9 licence texts are `SUSPECT`, and the top human false positives are release
+  notes. The corroboration rule keeps them out of `LIKELY_SYNTHETIC`, not out of
+  `SUSPECT`.
 - **The families are not fully independent.** The strongest measured cross-family
   correlation on human text is 0.49, so two families firing together is weaker evidence
   than two truly independent tests would be.
@@ -252,7 +290,8 @@ tokens/s for the scoring pass with every family active.
 |---|---|
 | `src/chaff/` | The package |
 | `src/chaff/metrics/` | The `Signal` contract and the metric families |
-| `tests/` | 203 tests |
+| `tests/` | 212 tests |
+| [`benchmarks/EVALUATION.md`](benchmarks/EVALUATION.md) | true-positive evaluation: MAGE, blind Claude, contamination sweep, failure cases |
 | [`benchmarks/`](benchmarks/) | false-positive benchmark on guaranteed-human text |
 | [`data/samples/`](data/samples/) | 10 labelled documents, including deliberate hard cases |
 

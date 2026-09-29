@@ -1,0 +1,192 @@
+# Evaluation
+
+How much synthetic text chaff catches, at what cost, and where it fails. Everything
+here is reproducible with `benchmarks/evaluate.py`. The corpora are rebuilt locally and
+nothing from them is committed; this file reports only numbers and document IDs.
+
+## Summary
+
+- **Older open-weight base models: caught well.** On the MAGE benchmark, 85–100% of
+  BLOOM, GPT-J/NeoX, FLAN-T5 and OPT output is flagged (AUC 0.92–0.99), as is 65–68% of
+  LLaMA-1 output.
+- **Modern instruction-tuned models: caught poorly.** OpenAI GPT-3.5/davinci/GPT-4 output
+  is 30–40% flagged (AUC 0.61–0.64). Claude-written technical documentation is 19%
+  flagged against a 9% false-positive rate (AUC 0.78 for ranking, weak at the threshold).
+- **Its founding premise was half right.** Older models do produce compressed,
+  repetitive text. Modern ones produce text that is *more* diverse than human writing of
+  the same genre. The one-sided design ranked Claude's documentation as more human than
+  human documentation (AUC 0.04). Scoring atypicality in **both** directions fixed that
+  (0.78), and the change was confirmed on held-out data (0.61 → 0.87).
+- **False positives depend on genre.** Calibrated on technical reference text, 0.92% of
+  clean documents reach `LIKELY_SYNTHETIC`. On other genres it's 0–5.1%, and the
+  flagged share (`SUSPECT` or above) runs 11–38%. Changelogs and licence boilerplate are
+  the characteristic human false positives.
+- **Use `--reference` with a genre-matched human corpus.** In corpus-relative mode,
+  detection degrades as contamination rises. Reference mode doesn't.
+
+chaff is a triage instrument for **older and open-weight model contamination and heavy
+templated contamination**. It is not a reliable detector of frontier-model text.
+
+## Setup
+
+| Source | Synthetic | Human | Notes |
+|---|---|---|---|
+| **tech** | 80 by blind Claude subagents: 40 man pages, 40 Python-module docstring sets | 871 held-out docs from the human baseline (708 man pages, 163 stdlib modules) | Genre-matched. The writers never saw chaff, its detectors, or the purpose of the task. Fictional tools and modules, so no output paraphrases a baseline document. |
+| **literary** | 40 blind-Claude essays | 315 chunks of 10 Project Gutenberg books (pre-1928) | **Era-confounded**: modern essays against 19th-century prose. Reported, but not used for conclusions. |
+| **MAGE** (Li et al., ACL 2024) | 1,500 from 24 generators in 7 families | 856 from 10 domains | Documents of ≥ 250 words only (MAGE's median is 115). |
+| **MAGE GPT-4** | 345 GPT-4 | 144 | MAGE's unseen-domain set: CNN, IMDB, PubMed, DialogSum. |
+| **MAGE confirm** | 1,000 | 442 | Fresh MAGE documents built *after* the two-sided hypothesis was formed, sharing no text with any analysed document. |
+
+**Modes.** *Corpus-relative* is the default: each document is compared with the rest of
+the corpus. *Reference* compares each document with a disjoint half of the same source's
+human text (`--reference`). *Stratify* normalises within a genre or domain field
+(`--stratify-by`). "Flagged" means `SUSPECT` or `LIKELY_SYNTHETIC`.
+
+## Results
+
+Recommended mode: reference with stratification.
+
+| Experiment | Recall flagged | Recall LIKELY | FPR flagged | FPR LIKELY | AUC |
+|---|---|---|---|---|---|
+| tech: reference + stratify genre | 18.8% | 0.0% | 9.3% | 1.1% | 0.778 |
+| MAGE: reference + stratify domain | 77.5% | 44.8% | 21.6% | 1.9% | 0.885 |
+| MAGE GPT-4: reference + stratify domain | 67.5% | 28.1% | 17.4% | 2.8% | 0.774 |
+| **MAGE confirm: reference + stratify domain** | **72.8%** | **42.2%** | **18.1%** | **2.3%** | **0.872** |
+| literary: reference *(era-confounded)* | 100% | 27.5% | 11.7% | 0.6% | 0.921 |
+
+Default corpus-relative mode:
+
+| Experiment | Recall flagged | Recall LIKELY | FPR flagged | FPR LIKELY | AUC |
+|---|---|---|---|---|---|
+| tech | 3.8% | 0.0% | 9.2% | 0.5% | 0.406 |
+| MAGE | 29.3% | 6.1% | 12.4% | 0.1% | 0.782 |
+| MAGE GPT-4 | 63.5% | 5.5% | 12.5% | 1.4% | 0.698 |
+| MAGE confirm | 30.2% | 9.0% | 12.2% | 0.2% | 0.757 |
+
+**Precision depends on prevalence.** MAGE's evaluation set is 64% synthetic, so its
+97.7% precision at `LIKELY` is inflated. Using the confirmation set's rates (42.2%
+recall, 2.3% FPR at `LIKELY`), precision would be about **49% at 5% contamination** and
+about **82% at 20%**.
+
+### By generator family (MAGE, reference + stratify domain)
+
+| Family | Recall flagged | Recall LIKELY | AUC | Confirm set: recall flagged / AUC |
+|---|---|---|---|---|
+| BLOOM | 100% | 66.7% | 0.981 | 100% / 0.979 |
+| EleutherAI (GPT-J, NeoX) | 99.1% | 79.3% | 0.986 | 100% / 0.982 |
+| FLAN-T5 (n = 17) | 94.1% | 47.1% | 0.951 | 100% / 0.985 |
+| OPT | 90.1% | 49.3% | 0.930 | 85.2% / 0.922 |
+| GLM-130B | 85.8% | 59.7% | 0.939 | 83.8% / 0.932 |
+| LLaMA-1 (7–65B) | 67.5% | 38.7% | 0.879 | 64.9% / 0.876 |
+| **OpenAI** (GPT-3.5, davinci-002/003, GPT-4) | **39.9%** | **7.3%** | **0.637** | **29.9% / 0.610** |
+
+The ordering follows how heavily instruction-tuned each generator is. The confirmation
+set reproduces it family by family.
+
+## The finding that changed the design
+
+chaff was built on the premise that synthetic text has a **compressed, repetitive
+vocabulary** (CORE_PROBLEM §3.1). Per-signal AUC on the raw values, with each signal's
+declared direction applied, shows where that holds:
+
+| Signal | tech (Claude) | MAGE (older) | MAGE GPT-4 |
+|---|---|---|---|
+| MTLD (lexical diversity) | **0.12** | 0.49 | 0.40 |
+| Yule's K (repetition) | **0.23** | 0.51 | 0.64 |
+| hapax ratio | 0.38 | 0.45 | **0.20** |
+| 4-gram repetition | 0.33 | 0.59 | 0.34 |
+| 8-gram repetition | 0.33 | 0.65 | 0.33 |
+| step novelty | 0.28 | 0.54 | 0.37 |
+| mean surprisal | 0.21 | 0.60 | 0.70 |
+
+Values below 0.5 mean the signal points the wrong way. Modern models write with
+**richer vocabulary and less repetition** than the human text of the same genre. That's
+the opposite of the premise, and it's why one-sided scoring *inverted*.
+
+So the distributional, surprisal and reasoning families now flag documents that are
+atypical for their genre **in either direction**; the artifact family stays one-sided.
+The change was pre-registered and tested on the MAGE confirmation set:
+
+| AUC | One-sided (phase 5) | Two-sided (phase 6) |
+|---|---|---|
+| tech (reference + stratify) | 0.036 | **0.778** |
+| MAGE (reference + stratify) | 0.583 | **0.885** |
+| MAGE GPT-4 (reference + stratify) | 0.635 | **0.774** |
+| **MAGE confirm, never analysed** (reference + stratify) | 0.605 | **0.872** |
+| MAGE confirm (corpus-relative) | 0.604 | **0.757** |
+
+Recalibrated on the human baseline, the two-sided design keeps the held-out
+`LIKELY_SYNTHETIC` rate at 0.92%, lowers `SUSPECT` from 8.15% to 6.66%, and every
+held-out `SUSPECT` document now scores ≥ 80.
+
+The hypothesis was formed from the tech, MAGE and GPT-4 results. The confirmation set is
+the only evidence here that it generalises, and a single model family can't settle it.
+
+## Contamination sweep (tech)
+
+The share of synthetic documents in a corpus was varied by subsampling:
+
+| Synthetic share | Corpus-relative AUC | Corpus-relative FPR flagged | Reference AUC | Reference FPR flagged |
+|---|---|---|---|---|
+| 2% | 0.447 | 7.8% | 0.603 | 9.3% |
+| 8% | 0.405 | 8.6% | 0.671 | 9.3% |
+| 20% | 0.343 | 11.2% | 0.668 | 8.1% |
+| 50% | 0.295 | 16.2% | 0.713 | 11.2% |
+
+As contamination rises, corpus-relative scoring gets worse, because the contamination
+becomes part of what "typical" means, and the false-positive rate on human documents
+climbs with it. Reference mode stays stable. **When a trusted human corpus exists, use
+it.**
+
+## False positives by genre
+
+| Human text | Docs | Flagged | LIKELY |
+|---|---|---|---|
+| Man pages (held-out baseline) | 708 | 8.8% | 1.1% |
+| Python stdlib docstrings (held-out baseline) | 163 | 11.7% | 1.2% |
+| MAGE squad / wp / xsum / yelp | 27–150 each | 11–19% | 0–2% |
+| MAGE eli5 / cmv | 150 each | 22–30% | 0.7–3.3% |
+| MAGE science abstracts | 79 | **38%** | **5.1%** |
+| Licence texts | 9 | **7 of 9** SUSPECT, 0 LIKELY | 0 |
+
+**Licences** (all nine, scored against the technical reference): the Python 3.9
+`LICENSE`, and the `six`, `setuptools`, `wheel`, `future`, `macholib` and `pip` licences
+are all `SUSPECT` through surprisal: boilerplate is highly predictable. `altgraph`'s
+licence and vim's `editorconfig` licence are `CLEAN`. Nine documents can't support a
+rate; they're listed individually for that reason. The corroboration rule is what keeps
+every one of them out of `LIKELY_SYNTHETIC`.
+
+## Failure cases (tech, reference + stratify)
+
+Highest-scoring human documents:
+
+| Document | Tier | Score | Families fired |
+|---|---|---|---|
+| `man1/perldocstyle.1` (Perl documentation style guide) | LIKELY | 100.0 | artifact, distributional, reasoning |
+| `man7/Accelerate.7` (Apple framework overview) | LIKELY | 100.0 | artifact, surprisal |
+| `man1/perl5123delta.1` (Perl release notes) | LIKELY | 99.5 | distributional, surprisal |
+| `man1/perl5181delta.1` (Perl release notes) | SUSPECT | 99.5 | surprisal |
+
+Release notes, a style guide and a marketing-flavoured framework overview are exactly
+the templated or promotional human genres CORE_PROBLEM predicted.
+
+Lowest-scoring synthetic documents: `moduledoc/b13_versionspec` (16.4),
+`moduledoc/b06_xmlpath` (29.9), `man/b11_timeout2` (31.3), `man/b14_encwrap` (37.8).
+All are `CLEAN`, with no family firing. They are simply typical of their genre.
+
+## Scale
+
+100,000 documents (~25M tokens), end to end with `chaff score`: **5.1 minutes, 2.2 GB
+peak memory**, single-threaded, two passes over the corpus.
+
+## Caveats
+
+- **Single-family synthetic text for tech and literary.** The blind subagents are all
+  Claude. MAGE supplies the cross-model evidence.
+- **MAGE's generators are older and continuation-prompted.** Its GPT-4 set is small (345)
+  and domain-shifted. Neither is a sample of the current web.
+- **The literary comparison is confounded by era** and supports no conclusions.
+- **Calibration is on technical reference text.** The false-positive rates above show it
+  doesn't transfer, so re-calibrate on a trusted human corpus of your own genre before
+  relying on the tiers.
+- **Legal text is nine documents.**

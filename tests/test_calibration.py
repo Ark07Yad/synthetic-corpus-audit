@@ -67,4 +67,13 @@ def test_tier_and_score_agree_on_held_out_human_text():
     by_tier = load_calibration().meta["evaluation"]["B"]["score_by_tier_min_median"]
     clean_median = by_tier["CLEAN"][1]
     assert by_tier["SUSPECT"][0] > clean_median
-    assert by_tier["LIKELY"][0] > by_tier["SUSPECT"][1]
+    # LIKELY and SUSPECT may overlap at the top (one extreme family can outscore two
+    # moderate ones under Fisher), but LIKELY must sit higher on the whole.
+    assert by_tier["LIKELY"][1] >= by_tier["SUSPECT"][1]
+
+
+def test_shipped_calibration_is_two_sided_where_intended():
+    cal = load_calibration()
+    assert set(cal.thresholds_low) == {"distributional", "surprisal", "reasoning"}
+    for family, low in cal.thresholds_low.items():
+        assert low < cal.thresholds[family]

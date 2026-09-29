@@ -17,14 +17,28 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 from .scoring import TIERS
 
-#: Evidence below this z is not shown in reports: a signal at z 0.03 is not evidence of
-#: anything, and listing it next to real evidence dilutes the explanation.
+#: Evidence weaker than this is not shown in reports: a signal at z 0.03 is not evidence
+#: of anything, and listing it next to real evidence dilutes the explanation. Strength is
+#: |z| for two-sided families, where "too diverse" counts as much as "too repetitive".
 #: ``chaff explain`` still shows every signal, for debugging.
 NOTABLE_Z = 1.0
 
+
+def _fam_label(f: str, r: Mapping[str, Any]) -> str:
+    side = r.get("side")
+    return "{0} z={1:+.2f}{2}".format(f, r["z"], " ✔ ({0})".format(side) if r["fired"] and side else (" ✔" if r["fired"] else ""))
+
+
+def _notable(doc: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    return [x for x in doc["evidence"] if x.get("strength", x["z"]) >= NOTABLE_Z][:5]
+
+
+def _dev(x: Mapping[str, Any]) -> str:
+    return {"above": "above typical", "below": "below typical"}.get(x.get("deviation", ""), "")
+
 _TIER_BLURB = {
-    "LIKELY_SYNTHETIC": "two or more independent-ish families exceed their calibrated threshold",
-    "SUSPECT": "exactly one family exceeds its threshold",
+    "LIKELY_SYNTHETIC": "two or more families are atypical beyond their calibrated thresholds",
+    "SUSPECT": "exactly one family is atypical beyond its threshold",
     "CLEAN": "no family exceeds its threshold",
     "UNSCORED": "too short to analyse (under 50 words)",
 }
@@ -114,13 +128,13 @@ def render_markdown(meta: Mapping[str, Any], top: Sequence[Mapping[str, Any]]) -
     for doc in top:
         out.append("### {0} — {1} · score {2:.1f}".format(doc["doc_id"], doc["tier"], doc["score"] or 0))
         out.append("")
-        fams = ", ".join("{0} z={1:+.2f}{2}".format(f, r["z"], " ✔" if r["fired"] else "")
-                         for f, r in sorted(doc["families"].items(), key=lambda kv: -(kv[1]["z"] or 0)))
+        fams = ", ".join(_fam_label(f, r)
+                         for f, r in sorted(doc["families"].items(), key=lambda kv: -abs(kv[1]["z"] or 0)))
         out.append("Families: " + fams)
         out.append("")
-        for e in [x for x in doc["evidence"] if x["z"] >= NOTABLE_Z][:5]:
-            out.append("- **{0}** = {1:.4g} (z {2:+.2f}, vs {3}) — {4}".format(
-                e["signal"], e["value"], e["z"], e["basis"], e["description"]))
+        for e in _notable(doc):
+            out.append("- **{0}** = {1:.4g} ({2}; z {3:+.2f} vs {4}) — {5}".format(
+                e["signal"], e["value"], _dev(e), e["z"], e["basis"], e["description"]))
         out.append("")
     if meta.get("notes"):
         out.append("## Notes")
@@ -206,11 +220,11 @@ def render_html(meta: Mapping[str, Any], top: Sequence[Mapping[str, Any]]) -> st
     docs = []
     for doc in top:
         fams = " · ".join('<code>{0}</code> z {1:+.2f}{2}'.format(
-            e(f), r["z"], " <b>fired</b>" if r["fired"] else "")
-            for f, r in sorted(doc["families"].items(), key=lambda kv: -(kv[1]["z"] or 0)))
-        ev = "".join('<li><code>{0}</code> = {1:.4g} <span class="muted">(z {2:+.2f} vs {3})</span> — {4}</li>'.format(
-            e(x["signal"]), x["value"], x["z"], e(x["basis"]), e(x["description"]))
-            for x in [y for y in doc["evidence"] if y["z"] >= NOTABLE_Z][:5])
+            e(f), r["z"], " <b>fired ({0})</b>".format(e(r.get("side") or "")) if r["fired"] else "")
+            for f, r in sorted(doc["families"].items(), key=lambda kv: -abs(kv[1]["z"] or 0)))
+        ev = "".join('<li><code>{0}</code> = {1:.4g} <span class="muted">({2}; z {3:+.2f} vs {4})</span> — {5}</li>'.format(
+            e(x["signal"]), x["value"], e(_dev(x)), x["z"], e(x["basis"]), e(x["description"]))
+            for x in _notable(doc))
         docs.append('<div class="doc"><h3><span class="pill t-{tier}">{tier}</span>{id}</h3>'
                     '<div class="muted">score {score:.1f} · {words} words</div>'
                     '<div class="fam">{fams}</div><ul class="ev">{ev}</ul></div>'.format(
