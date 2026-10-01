@@ -70,7 +70,7 @@ A reasoning signal, `restatement`, correlated with the distributional family at 
 cross-family correlation is **0.49** (`stalled_step_ratio` × `repetition_4gram`). That's
 weaker coupling, but it isn't independence, and fusion has to account for it.
 
-### Calibrating fusion (phase 5)
+### Calibrating fusion (phase 5, recalibrated for two-sided scoring in phase 6)
 
 `calibrate` learns everything `chaff score` needs from this baseline and writes it to
 `src/chaff/calibration.json` (numbers only, no text, ~17 KB). It learns:
@@ -84,10 +84,10 @@ documents reach `LIKELY_SYNTHETIC`. That's α = 0.02. Held-out half B then gives
 
 | | Half A (fit) | Half B (held out) |
 |---|---|---|
-| `LIKELY_SYNTHETIC` | 0.68% | **0.92%** |
-| `SUSPECT` | 6.16% | 8.15% |
-| `LIKELY` if the families were independent | 0.21% | 0.35% |
-| dependence inflation | 3.3× | **2.6×** |
+| `LIKELY_SYNTHETIC` | 0.91% | **0.92%** |
+| `SUSPECT` | 5.36% | 6.66% |
+| `LIKELY` if the families were independent | 0.19% | 0.26% |
+| dependence inflation | 4.8× | **3.6×** |
 
 Because α was chosen on the *measured* joint rate, the calibration already includes the
 families' real dependence. The inflation row shows how much an independence assumption
@@ -98,8 +98,14 @@ different code. Scoring the whole baseline with `chaff score` reproduces both ha
 rates exactly, to the hundredth of a percent.
 
 The minority genre pays for corpus-relative normalisation. On half B, the distributional
-family fires on **6.1% of stdlib documents** against 1.8% of man pages, because man pages
-are 81% of the baseline. That's the minority-genre penalty the main README warns about.
+family fires on **4.3% of stdlib documents** against 1.4% of man pages, because man pages
+are 81% of the baseline. That's the minority-genre penalty the main README warns about;
+`--stratify-by` removes most of it.
+
+Since phase 7 the procedure lives in the package (`src/chaff/calibrate.py`), and
+`chaff calibrate <trusted-corpus> --out mine.json` runs it on your own corpus. This script
+is a wrapper around the same code, and it still reproduces the shipped
+`calibration.json` exactly, every field but the date.
 
 ### What this benchmark cannot tell you
 

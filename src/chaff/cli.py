@@ -1,6 +1,8 @@
 """Command line interface.
 
     chaff score <corpus>       fuse signals into calibrated tiers, scores and evidence
+    chaff calibrate <corpus>   learn thresholds from a trusted human corpus of your genre
+    chaff dedup <corpus>       cluster near-duplicate documents (template floods)
     chaff explain <scores> ID  why one document got its tier
     chaff report <scores>      render a scoring run as Markdown, JSON or HTML
     chaff profile <corpus>     corpus shape + raw signals, no scoring
@@ -22,7 +24,8 @@ from .corpus_io import CorpusError, iter_documents, write_jsonl
 from .lm import StreamMismatchError
 from .metrics import FAMILIES, bind_contextual, contextual_registered, registered
 from .metrics.surprisal import MIN_COVERAGE_SENTENCE_SPREAD, MIN_COVERAGE_TOKEN_SPREAD
-from .pipeline import build_context, profile_corpus, profile_document, score_corpus, short_document_note
+from .pipeline import (build_context, non_english_note, profile_corpus, profile_document, score_corpus,
+                       short_document_note)
 from .report import RENDERERS, load_run
 from .tokenization import build_view
 
@@ -47,16 +50,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version="chaff {0}".format(__version__))
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("corpus", help="path to a .jsonl[.gz] file, a directory, or - for stdin")
-    common.add_argument("--text-field", default=None,
-                        help="record field holding the document text (default: autodetect)")
-    common.add_argument("--limit", type=int, default=None, help="stop after N documents")
-    common.add_argument("--min-chars", type=int, default=0,
-                        help="skip documents shorter than N characters")
+    reading = argparse.ArgumentParser(add_help=False)
+    reading.add_argument("corpus", help="path to a .jsonl[.gz] file, a directory, or - for stdin")
+    reading.add_argument("--text-field", default=None,
+                         help="record field holding the document text (default: autodetect)")
+    reading.add_argument("--limit", type=int, default=None, help="stop after N documents")
+    reading.add_argument("--min-chars", type=int, default=0,
+                         help="skip documents shorter than N characters")
+    common = argparse.ArgumentParser(add_help=False, parents=[reading])
     common.add_argument("--reference", default=None, metavar="CORPUS",
                         help="build the language model from this trusted corpus instead of "
                              "the audited one (also skips the audited corpus's extra pass)")
+    common.add_argument("--allow-non-english", action="store_true",
+                        help="analyse documents that are evidently not English instead of leaving "
+                             "them UNSCORED (chaff's reference distributions are English)")
 
     p_profile = sub.add_parser("profile", parents=[common],
                                help="profile corpus shape and registered signals")
@@ -86,7 +93,25 @@ def _build_parser() -> argparse.ArgumentParser:
     p_score.add_argument("--stratify-by", default=None, metavar="FIELD",
                          help="normalise each document against others with the same value of this "
                               "record field (e.g. source, domain, genre): removes the penalty "
-                              "corpus-relative scoring puts on minority genres"),
+                              "corpus-relative scoring puts on minority genres")
+
+    p_cal = sub.add_parser("calibrate", parents=[common],
+                           help="learn thresholds from a trusted human corpus of your own genre")
+    p_cal.add_argument("--out", required=True, metavar="CALIBRATION",
+                       help="write the calibration JSON here; pass it to 'chaff score --calibration'")
+    p_cal.add_argument("--likely-target", type=float, default=0.01, metavar="RATE",
+                       help="most clean documents allowed to reach LIKELY_SYNTHETIC (default 0.01)")
+    p_cal.add_argument("--stratify-by", default=None, metavar="FIELD",
+                       help="normalise within groups of this field; use the same flag when scoring")
+
+    p_dedup = sub.add_parser("dedup", parents=[reading],
+                             help="cluster near-duplicate documents (template floods)")
+    p_dedup.add_argument("--out", default=None, metavar="CLUSTERS",
+                         help="write one JSON line per document with its cluster here")
+    p_dedup.add_argument("--threshold", type=float, default=0.8, metavar="J",
+                         help="estimated Jaccard similarity on word 5-grams to count as a "
+                              "near-duplicate (default 0.8)")
+    p_dedup.add_argument("--top", type=int, default=10, help="clusters to list (default: 10)")
 
     p_explain = sub.add_parser("explain", help="why one document got its tier")
     p_explain.add_argument("scores", help="scores file written by 'chaff score --out'")
@@ -115,6 +140,7 @@ def cmd_profile(args: argparse.Namespace) -> int:
         families=args.family,
         on_row=(lambda row: collector(row.to_row())) if collector else None,
         reference=args.reference,
+        language_guard=not args.allow_non_english,
     )
 
     if profile.n_documents == 0:
@@ -154,9 +180,9 @@ def cmd_profile(args: argparse.Namespace) -> int:
     for note in profile.notes:
         print("\nnote: {0}".format(note))
 
-    note = short_document_note(profile)
-    if note:
-        print("\nnote: {0}".format(note))
+    for note in (non_english_note(profile), short_document_note(profile)):
+        if note:
+            print("\nnote: {0}".format(note))
     return 0
 
 
@@ -204,14 +230,16 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         limit=args.limit, min_chars=args.min_chars,
     ):
         view = build_view(doc.text)
-        row = profile_document(doc, view=view, bound=bound)
+        row = profile_document(doc, view=view, bound=bound,
+                               language_guard=not args.allow_non_english)
         print("=" * 72)
         print("doc_id      {0}".format(doc.doc_id))
         if doc.label:
             print("label       {0}   (ground truth; never read by scoring)".format(doc.label))
         print("chars {0}  words {1}  types {2}  sentences {3}  lines {4}".format(
             row.n_chars, row.n_words, row.n_types, row.n_sentences, row.n_lines))
-        print("analysable  {0}".format("yes" if row.analysable else "no (too short)"))
+        print("analysable  {0}".format("yes" if row.analysable else "no ({0})".format(
+            row.unscored_reason or "too short")))
         print("preview     {0}".format(doc.preview))
         if view.words:
             print("first words {0}".format(" ".join(view.words[:14])))
@@ -263,6 +291,7 @@ def cmd_score(args: argparse.Namespace) -> int:
         args.corpus, text_field=args.text_field, limit=args.limit, min_chars=args.min_chars,
         reference=args.reference, calibration=load_calibration(args.calibration),
         scores_path=args.out, top_n=max(args.top, 25), stratify_by=args.stratify_by,
+        language_guard=not args.allow_non_english,
     )
     meta = run.meta
     if meta["documents"] == 0:
@@ -304,6 +333,89 @@ def cmd_score(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_calibrate(args: argparse.Namespace) -> int:
+    from .calibrate import CalibrationError, calibrate_corpus
+    if args.reference:
+        sys.stderr.write("note: --reference is ignored by calibrate; the corpus itself is the "
+                         "trusted human reference\n")
+    try:
+        run = calibrate_corpus(args.corpus, text_field=args.text_field, limit=args.limit,
+                               min_chars=args.min_chars, likely_target=args.likely_target,
+                               stratify_by=args.stratify_by,
+                               language_guard=not args.allow_non_english)
+    except CalibrationError as exc:
+        sys.stderr.write("error: {0}\n".format(exc))
+        return 2
+    cal = run.calibration
+    with open(args.out, "w", encoding="utf-8") as fh:
+        json.dump(cal.to_dict(), fh, indent=1, sort_keys=True)
+        fh.write("\n")
+
+    held = cal.meta["evaluation"]["B"]
+    fit = cal.meta["evaluation"]["A"]
+    print("calibrated on    {0}".format(args.corpus))
+    print("documents        {0} fit (half A), {1} held out (half B)".format(fit["documents"], held["documents"]))
+    print("alpha            {0} per family (largest keeping half-A LIKELY <= {1:.1%})".format(
+        cal.meta["alpha"], cal.meta["likely_target"]))
+    print("held-out half B  LIKELY_SYNTHETIC {0:.2%}   SUSPECT {1:.2%}   score median {2:.1f}".format(
+        held["likely_rate"], held["suspect_rate"], held["score_median"]))
+    ind = held["likely_rate_if_independent"]
+    if ind:
+        print("dependence       families co-fire {0:.1f}x more often than independence predicts".format(
+            held["likely_rate"] / ind))
+    for name, e in cal.meta["evaluation"].items():
+        if name.startswith("B_"):
+            print("  {0:<14} {1:>5} docs  LIKELY {2:6.2%}  SUSPECT {3:6.2%}".format(
+                name[2:], e["documents"], e["likely_rate"], e["suspect_rate"]))
+    for note in run.notes:
+        print("note: {0}".format(note))
+    strat = " --stratify-by {0}".format(args.stratify_by) if args.stratify_by else ""
+    print("\nwrote {0}. Score against it with:".format(args.out))
+    print("  chaff score <corpus> --reference {0} --calibration {1}{2}".format(args.corpus, args.out, strat))
+    return 0
+
+
+def cmd_dedup(args: argparse.Namespace) -> int:
+    from .dedup import dedup_corpus
+    if not 0.0 < args.threshold <= 1.0:
+        sys.stderr.write("error: --threshold must be in (0, 1]\n")
+        return 2
+    result = dedup_corpus(args.corpus, threshold=args.threshold, text_field=args.text_field,
+                          limit=args.limit, min_chars=args.min_chars)
+    compared = len(result.doc_ids)
+    if compared + result.skipped_short == 0:
+        sys.stderr.write("no documents found in {0}\n".format(args.corpus))
+        return 1
+    if args.out:
+        write_jsonl(args.out, result.rows())
+
+    in_clusters = result.documents_in_clusters
+    print("corpus           {0}".format(args.corpus))
+    print("documents        {0} compared, {1} too short to compare".format(
+        _fmt_int(compared), _fmt_int(result.skipped_short)))
+    print("threshold        Jaccard >= {0} on word 5-grams ({1} candidate pairs verified)".format(
+        result.threshold, _fmt_int(result.pairs_checked)))
+    print("near-duplicates  {0} clusters holding {1} documents ({2:.1%} of compared); "
+          "{3} would be removed keeping one per cluster".format(
+              _fmt_int(len(result.clusters)), _fmt_int(in_clusters),
+              in_clusters / compared if compared else 0.0,
+              _fmt_int(in_clusters - len(result.clusters))))
+    if result.clusters:
+        print("\n  size  example documents")
+        for members in result.clusters[: args.top]:
+            ids = [result.doc_ids[i] for i in members]
+            shown = ", ".join(ids[:3]) + (", ..." if len(ids) > 3 else "")
+            labels = sorted({result.labels[i] for i in members if result.labels[i] is not None})
+            print("  {0:>4}  {1}{2}".format(len(ids), shown,
+                                           "   [label: {0}]".format("/".join(labels)) if labels else ""))
+        if len(result.clusters) > args.top:
+            print("  ... {0} more".format(len(result.clusters) - args.top))
+    sys.stdout.flush()
+    if args.out:
+        sys.stderr.write("\nwrote {0}\n".format(args.out))
+    return 0
+
+
 def cmd_explain(args: argparse.Namespace) -> int:
     found = None
     with open(args.scores, encoding="utf-8") as fh:
@@ -321,7 +433,8 @@ def cmd_explain(args: argparse.Namespace) -> int:
     print("doc_id    {0}".format(found["doc_id"]))
     print("tier      {0}".format(found["tier"]))
     if found["score"] is None:
-        print("          too short to analyse ({0} words); nothing was scored".format(found["n_words"]))
+        print("          {0}; nothing was scored".format(
+            found.get("reason") or "too short to analyse ({0} words)".format(found["n_words"])))
         return 0
     print("score     {0:.1f} / 100   (combined evidence, as a percentile among clean human documents)".format(found["score"]))
     if "label" in found:
@@ -366,7 +479,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     handlers = {"profile": cmd_profile, "inspect": cmd_inspect, "families": cmd_families,
-                "score": cmd_score, "explain": cmd_explain, "report": cmd_report}
+                "score": cmd_score, "explain": cmd_explain, "report": cmd_report,
+                "calibrate": cmd_calibrate, "dedup": cmd_dedup}
     try:
         return handlers[args.command](args)
     except (CorpusError, StreamMismatchError) as exc:

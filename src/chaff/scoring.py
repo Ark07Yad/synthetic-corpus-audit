@@ -179,6 +179,8 @@ class Row:
     #: Stratification group (``--stratify-by``): documents are normalised against
     #: others in the same group. ``None`` when not stratifying.
     group: Optional[str] = None
+    #: Why a long-enough document was not analysed (the language guard), if it was not.
+    reason: Optional[str] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True)
@@ -491,6 +493,8 @@ class ScoredDoc:
     families: Dict[str, FamilyResult]
     evidence: List[Evidence]
     label: Optional[str] = None
+    #: Why the document is UNSCORED, when it is long enough to have been scored.
+    reason: Optional[str] = None
 
     @property
     def fired(self) -> List[str]:
@@ -513,6 +517,7 @@ class ScoredDoc:
                           "deviation": e.deviation, "basis": e.basis, "description": e.description}
                          for e in self.evidence[:max_evidence]],
             **({"label": self.label} if self.label is not None else {}),
+            **({"reason": self.reason} if self.reason is not None else {}),
         }
 
 
@@ -583,7 +588,7 @@ def score_row(
     """Steps 1-4 for one document."""
     if not row.analysable or not row.signals:
         return ScoredDoc(doc_id=row.doc_id, tier=TIER_UNSCORED, score=None, n_words=row.n_words,
-                         families={}, evidence=[], label=row.label)
+                         families={}, evidence=[], label=row.label, reason=row.reason)
 
     evidence = normalise(row.signals, row.n_words, catalog, stats, calibration, dropped, row.group)
     families: Dict[str, FamilyResult] = {}

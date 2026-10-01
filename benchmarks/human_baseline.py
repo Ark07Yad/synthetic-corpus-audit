@@ -248,187 +248,35 @@ def cmd_report(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- calibrate
 
 CALIBRATION_PATH = os.path.join(HERE, "..", "src", "chaff", "calibration.json")
-#: At most this share of clean documents may be tiered LIKELY_SYNTHETIC on half A.
-LIKELY_TARGET = 0.01
-ALPHA_GRID = (0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10)
-NULL_QUANTILES = 201
-
-
-def _quantiles(sorted_values: List[float], n: int) -> List[float]:
-    last = len(sorted_values) - 1
-    return [round(sorted_values[int(round(i * last / (n - 1)))], 6) for i in range(n)]
-
-
-def _threshold(sorted_values: List[float], alpha: float) -> float:
-    """Value T with at most ``alpha`` of the null strictly above it."""
-    k = max(0, int(math.ceil((1.0 - alpha) * len(sorted_values))) - 1)
-    return sorted_values[k]
-
-
-def _threshold_low(sorted_values: List[float], alpha: float) -> float:
-    """Value T with at most ``alpha`` of the null strictly below it."""
-    k = min(len(sorted_values) - 1, int(math.floor(alpha * len(sorted_values))))
-    return sorted_values[k]
-
-
-def _fires(fam: str, z: float, thresholds: Dict[str, float], low: Dict[str, float]) -> bool:
-    return z > thresholds[fam] or (fam in low and z < low[fam])
-
-
-def _tier_rates(family_z: List[Dict[str, float]], thresholds: Dict[str, float], low: Dict[str, float]):
-    fires = defaultdict(int)
-    suspect = likely = 0
-    for fz in family_z:
-        n = 0
-        for fam, z in fz.items():
-            if _fires(fam, z, thresholds, low):
-                fires[fam] += 1
-                n += 1
-        suspect += n == 1
-        likely += n >= 2
-    total = float(len(family_z)) or 1.0
-    return {f: fires[f] / total for f in thresholds}, suspect / total, likely / total
-
-
-def _independent_likely(marginals: Dict[str, float]) -> float:
-    """P(at least two of the families fire) if they fired independently."""
-    ps = list(marginals.values())
-    none = 1.0
-    for p in ps:
-        none *= 1.0 - p
-    exactly_one = sum(p * math.prod(1.0 - q for j, q in enumerate(ps) if j != i) for i, p in enumerate(ps))
-    return 1.0 - none - exactly_one
+BASELINE_DESCRIPTION = ("Python stdlib docstrings (pre-LLM by date) + man pages; "
+                        "benchmarks/human_baseline.py")
 
 
 def cmd_calibrate(args: argparse.Namespace) -> int:
-    from chaff import __version__
-    from chaff.metrics import FAMILIES
-    from chaff.pipeline import collect_rows
-    from chaff.scoring import (AGGREGATION, NORMALISATION, BASIS_HUMAN, CALIBRATION_PRECISION,
-                               SIDEDNESS, SIDE_TWO, Calibration, HumanReference, aggregate,
-                               build_reference_stats, normalise)
+    """Rebuild the shipped calibration. The procedure itself lives in
+    ``chaff.calibrate`` (phase 7) so users can run it on their own corpus with
+    ``chaff calibrate``; this wrapper only fixes the inputs and prints the details."""
+    from chaff.calibrate import calibrate_corpus
 
-    rows_path = os.path.join(OUT_DIR, "human_baseline.fusion_rows.jsonl")
-    with open(rows_path, "w", encoding="utf-8") as fh:
-        _, catalog = collect_rows(CORPUS, fh)
-    from chaff.scoring import Row
-    rows = [Row.from_json(l) for l in open(rows_path, encoding="utf-8") if l.strip()]
-    rows = [r for r in rows if r.analysable]
-    halves, sources = {}, {}
-    for line in open(CORPUS, encoding="utf-8"):
-        rec = json.loads(line)
-        halves[rec["id"]], sources[rec["id"]] = rec["half"], rec["source"]
-
-    # Continuous signals are normalised against the whole baseline, exactly as `chaff
-    # score` normalises against a whole audited corpus. Artifact signals use half A only,
-    # so half B documents are scored out-of-sample against the human distribution.
-    stats = build_reference_stats(rows, catalog)
-    artifact_values = defaultdict(list)
-    for r in rows:
-        if halves[r.doc_id] != "A":
-            continue
-        for name, value in r.signals.items():
-            if NORMALISATION.get(catalog[name].family) == BASIS_HUMAN:
-                artifact_values[name].append(value)
-    human = HumanReference.from_values(artifact_values)
-    provisional = Calibration(thresholds={}, family_null={}, human=human)
-
-    family_z = {}
-    for r in rows:
-        ev = normalise(r.signals, r.n_words, catalog, stats, provisional)
-        # Rounded exactly as chaff.scoring.score_row rounds before comparing, so the
-        # thresholds and null quantiles written below match the values they will be
-        # compared against at scoring time.
-        family_z[r.doc_id] = {f: round(z, CALIBRATION_PRECISION) for f, (z, _n) in aggregate(ev).items()}
-    a_ids = [d for d in family_z if halves[d] == "A"]
-    b_ids = [d for d in family_z if halves[d] == "B"]
-    null = {f: sorted(family_z[d][f] for d in a_ids if f in family_z[d]) for f in FAMILIES}
-    null = {f: v for f, v in null.items() if v}
-
-    chosen = None
-    print("alpha search on half A (target: LIKELY_SYNTHETIC <= {0:.1%} of clean docs)".format(LIKELY_TARGET))
-    def thresholds_for(alpha):
-        # Two-sided families split alpha between the tails, so every family fires on
-        # at most alpha of clean documents whichever way it is sided.
-        high, low = {}, {}
-        for f, v in null.items():
-            if SIDEDNESS.get(f) == SIDE_TWO:
-                high[f], low[f] = _threshold(v, alpha / 2.0), _threshold_low(v, alpha / 2.0)
-            else:
-                high[f] = _threshold(v, alpha)
-        return high, low
-
-    for alpha in ALPHA_GRID:
-        thresholds, low = thresholds_for(alpha)
-        _, suspect, likely = _tier_rates([family_z[d] for d in a_ids], thresholds, low)
-        ok = likely <= LIKELY_TARGET
-        print("  alpha {0:<7} SUSPECT {1:6.2%}  LIKELY {2:6.2%}  {3}".format(alpha, suspect, likely, "ok" if ok else "over"))
-        if ok:
-            chosen = (alpha, thresholds, low)
-    alpha, thresholds, low = chosen
-
-    def evaluate(ids):
-        marg, suspect, likely = _tier_rates([family_z[d] for d in ids], thresholds, low)
-        return {"documents": len(ids), "family_fire_rate": {k: round(v, 5) for k, v in marg.items()},
-                "suspect_rate": round(suspect, 5), "likely_rate": round(likely, 5),
-                "likely_rate_if_independent": round(_independent_likely(marg), 5)}
-
-    evaluation = {"A": evaluate(a_ids), "B": evaluate(b_ids)}
-    for src in ("stdlib", "man"):
-        evaluation["B_" + src] = evaluate([d for d in b_ids if sources[d] == src])
-
-    import datetime
-    meta = {
-        "created": datetime.date.today().isoformat(),
-        "chaff_version": __version__,
-        "python": "{0}.{1}.{2}".format(*sys.version_info[:3]),
-        "baseline": "Python stdlib docstrings (pre-LLM by date) + man pages; benchmarks/human_baseline.py",
-        "documents": {"A": len(a_ids), "B": len(b_ids)},
-        "likely_target": LIKELY_TARGET,
-        "alpha": alpha,
-        "rule": ("one-sided families fire when z > the (1-alpha) quantile of half-A family z; "
-                 "two-sided families fire outside the alpha/2 and (1-alpha/2) quantiles (strict)"),
-        "sidedness": SIDEDNESS,
-        "normalisation": NORMALISATION,
-        "aggregation": AGGREGATION,
-        "evaluation": evaluation,
-    }
-    cal = Calibration(thresholds={f: round(t, 6) for f, t in thresholds.items()},
-                      family_null={f: _quantiles(v, NULL_QUANTILES) for f, v in null.items()},
-                      human=human, signals=sorted(catalog), meta=meta,
-                      thresholds_low={f: round(t, 6) for f, t in low.items()})
-    # The score's own null: the evidence statistic over half A, so that a clean
-    # document's score is uniform on 0-100 rather than wherever the raw statistic sits.
-    def stat(doc_id):
-        return cal.statistic({f: cal.percentile(f, z) for f, z in family_z[doc_id].items()})
-    cal.score_null = _quantiles(sorted(round(stat(d), CALIBRATION_PRECISION) for d in a_ids), NULL_QUANTILES)
-
-    b_score = {d: cal.score(stat(d)) for d in b_ids}
-    ordered = sorted(b_score.values())
-    meta["evaluation"]["B"]["score_median"] = round(ordered[len(ordered) // 2], 2)
-    meta["evaluation"]["B"]["score_p95"] = round(ordered[int(0.95 * len(ordered))], 2)
-    # Coherence: a document that fires a family should outrank a typical clean one.
-    by_tier = defaultdict(list)
-    for d in b_ids:
-        n = sum(1 for f, z in family_z[d].items() if _fires(f, z, thresholds, low))
-        by_tier["LIKELY" if n >= 2 else "SUSPECT" if n == 1 else "CLEAN"].append(b_score[d])
-    meta["evaluation"]["B"]["score_by_tier_min_median"] = {
-        t: [round(min(v), 1), round(sorted(v)[len(v) // 2], 1)] for t, v in by_tier.items()}
+    run = calibrate_corpus(CORPUS, breakdown_by="source", source=BASELINE_DESCRIPTION)
+    cal = run.calibration
+    print("alpha search on half A (target: LIKELY_SYNTHETIC <= {0:.1%} of clean docs)".format(
+        cal.meta["likely_target"]))
+    for alpha, suspect, likely, ok in run.alpha_search:
+        print("  alpha {0:<7} SUSPECT {1:6.2%}  LIKELY {2:6.2%}  {3}".format(
+            alpha, suspect, likely, "ok" if ok else "over"))
+    held = cal.meta["evaluation"]["B"]
     print("held-out half B scores: median {0:.1f}, p95 {1:.1f} (calibrated: ~50 and ~95)".format(
-        meta["evaluation"]["B"]["score_median"], meta["evaluation"]["B"]["score_p95"]))
-    for t in ("CLEAN", "SUSPECT", "LIKELY"):
-        if by_tier[t]:
-            v = sorted(by_tier[t])
-            print("  {0:<8} n={1:<4} score min {2:5.1f}  median {3:5.1f}".format(t, len(v), v[0], v[len(v) // 2]))
+        held["score_median"], held["score_p95"]))
     with open(CALIBRATION_PATH, "w", encoding="utf-8") as fh:
         json.dump(cal.to_dict(), fh, indent=1, sort_keys=True)
         fh.write("\n")
-
-    print("\nchosen alpha {0} -> high {1}  low {2}".format(alpha, {f: round(t, 3) for f, t in thresholds.items()},
-                                                          {f: round(t, 3) for f, t in low.items()}))
+    print("\nchosen alpha {0} -> high {1}  low {2}".format(
+        cal.meta["alpha"], {f: round(t, 3) for f, t in cal.thresholds.items()},
+        {f: round(t, 3) for f, t in cal.thresholds_low.items()}))
     print("\n{0:<10} {1:>6} {2:>9} {3:>9} {4:>14} {5:>9}   per-family fire rate".format(
         "split", "docs", "SUSPECT", "LIKELY", "LIKELY if ind.", "inflation"))
-    for name, e in evaluation.items():
+    for name, e in cal.meta["evaluation"].items():
         ind = e["likely_rate_if_independent"]
         infl = (e["likely_rate"] / ind) if ind else float("nan")
         print("{0:<10} {1:>6} {2:>8.2%} {3:>8.2%} {4:>13.3%} {5:>8.1f}x   {6}".format(

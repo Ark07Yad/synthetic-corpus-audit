@@ -33,6 +33,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from .context import SOURCE_REFERENCE, SOURCE_SELF, CorpusContext
 from .corpus_io import iter_documents
 from .document import Document
+from .language import non_english_reason
 from .lm import NgramLM, StreamMismatchError
 from .metrics import Bound, Signal, bind_contextual, contextual_registered, extract_signals, registered
 from .stats import describe
@@ -59,6 +60,8 @@ class DocProfile:
     label: Optional[str] = None
     signals: List[Signal] = field(default_factory=list)
     group: Optional[str] = None
+    #: Why an otherwise long-enough document was not analysed (the language guard).
+    unscored_reason: Optional[str] = None
 
     def to_row(self) -> Dict[str, Any]:
         row: Dict[str, Any] = {
@@ -73,6 +76,8 @@ class DocProfile:
         }
         if self.label is not None:
             row["label"] = self.label
+        if self.unscored_reason is not None:
+            row["unscored_reason"] = self.unscored_reason
         for signal in self.signals:
             row[signal.name] = signal.value
         return row
@@ -85,6 +90,8 @@ class CorpusProfile:
     path: str
     n_documents: int = 0
     n_analysable: int = 0
+    #: Long enough to analyse but held out by the language guard.
+    n_non_english: int = 0
     n_words: int = 0
     vocabulary_size: int = 0
     hapax_count: int = 0
@@ -121,6 +128,7 @@ class CorpusProfile:
             "path": self.path,
             "n_documents": self.n_documents,
             "n_analysable": self.n_analysable,
+            "n_non_english": self.n_non_english,
             "n_words": self.n_words,
             "vocabulary_size": self.vocabulary_size,
             "hapax_count": self.hapax_count,
@@ -176,14 +184,18 @@ def profile_document(
     families: Optional[Iterable[str]] = None,
     view: Optional[TextView] = None,
     bound: Optional[Sequence[Bound]] = None,
+    language_guard: bool = True,
 ) -> DocProfile:
     """Build the text view for one document and run the registered extractors,
-    plus any contextual extractors already bound to a corpus context."""
+    plus any contextual extractors already bound to a corpus context.
+
+    With ``language_guard`` (the default), a document with positive evidence of being in
+    another language is left unanalysed, with the reason recorded: every reference
+    distribution chaff ships is English (see :mod:`chaff.language`)."""
     view = view if view is not None else build_view(doc.text)
-    signals = (
-        extract_signals(doc, view, families=families, bound=bound)
-        if view.is_analysable else []
-    )
+    reason = non_english_reason(view.words) if language_guard and view.is_analysable else None
+    analysable = view.is_analysable and reason is None
+    signals = extract_signals(doc, view, families=families, bound=bound) if analysable else []
     return DocProfile(
         doc_id=doc.doc_id,
         source=doc.source,
@@ -192,9 +204,10 @@ def profile_document(
         n_types=view.n_types,
         n_sentences=len(view.sentences),
         n_lines=len(view.lines),
-        analysable=view.is_analysable,
+        analysable=analysable,
         label=doc.label,
         signals=list(signals),
+        unscored_reason=reason,
     )
 
 
@@ -210,6 +223,7 @@ def profile_corpus(
     reference: Optional[str] = None,
     context: Optional[CorpusContext] = None,
     group_field: Optional[str] = None,
+    language_guard: bool = True,
 ) -> CorpusProfile:
     """Stream a corpus and profile every document in it.
 
@@ -226,6 +240,8 @@ def profile_corpus(
     context:
         A prebuilt context, bypassing pass 1 entirely. Mostly for tests and for
         callers profiling the same corpus repeatedly.
+    language_guard:
+        Leave documents that are evidently not English unanalysed (the default).
     """
     started = time.time()
     profile = CorpusProfile(path=path)
@@ -266,7 +282,8 @@ def profile_corpus(
         path, text_field=text_field, limit=limit, min_chars=min_chars
     ):
         view = build_view(doc.text)
-        row = profile_document(doc, families=families, view=view, bound=bound)
+        row = profile_document(doc, families=families, view=view, bound=bound,
+                               language_guard=language_guard)
         if group_field is not None:
             value = doc.meta.get(group_field)
             row.group = None if value is None else str(value)
@@ -275,6 +292,8 @@ def profile_corpus(
         profile.n_words += view.n_words
         if row.analysable:
             profile.n_analysable += 1
+        elif row.unscored_reason is not None:
+            profile.n_non_english += 1
         vocabulary.update(view.words)
         if measure_coverage:
             h, t = context.lm.bigram_hits(view.words)
@@ -308,9 +327,18 @@ def profile_corpus(
     return profile
 
 
+def non_english_note(profile: CorpusProfile) -> Optional[str]:
+    """Say how many documents the language guard held out."""
+    if not profile.n_non_english:
+        return None
+    return ("{0} of {1} documents are evidently not English and were left unscored: chaff's "
+            "reference distributions are English, so their scores would be meaningless "
+            "(--allow-non-english scores them anyway).").format(profile.n_non_english, profile.n_documents)
+
+
 def short_document_note(profile: CorpusProfile) -> Optional[str]:
     """Warn when most of a corpus is too short to analyse distributionally."""
-    skipped = profile.n_documents - profile.n_analysable
+    skipped = profile.n_documents - profile.n_analysable - profile.n_non_english
     if profile.n_documents and skipped / profile.n_documents > 0.25:
         return (
             "{0} of {1} documents are under {2} words and will not be scored: "
@@ -356,6 +384,7 @@ def collect_rows(
     context: Optional[CorpusContext] = None,
     reference: Optional[str] = None,
     group_field: Optional[str] = None,
+    language_guard: bool = True,
 ) -> "tuple":
     """Profile a corpus, streaming one :class:`Row` per document to ``spill``.
 
@@ -368,14 +397,15 @@ def collect_rows(
     def keep(doc: DocProfile) -> None:
         spill.write(Row(doc_id=doc.doc_id, n_words=doc.n_words, analysable=doc.analysable,
                         signals={s.name: s.value for s in doc.signals},
-                        label=doc.label, group=doc.group).to_json() + "\n")
+                        label=doc.label, group=doc.group,
+                        reason=doc.unscored_reason).to_json() + "\n")
         for s in doc.signals:
             if s.name not in catalog:
                 catalog[s.name] = SignalInfo(s.family, s.direction, s.description)
 
     profile = profile_corpus(path, text_field=text_field, limit=limit, min_chars=min_chars,
                              on_row=keep, row_cap=0, context=context, reference=reference,
-                             group_field=group_field)
+                             group_field=group_field, language_guard=language_guard)
     return profile, catalog
 
 
@@ -425,6 +455,7 @@ def score_corpus(
     scores_path: Optional[str] = None,
     top_n: int = DEFAULT_TOP_N,
     stratify_by: Optional[str] = None,
+    language_guard: bool = True,
 ) -> ScoreRun:
     """Profile, fuse and tier every document in a corpus."""
     started = time.time()
@@ -443,17 +474,18 @@ def score_corpus(
                                          lm=ref_context.lm)
             with open(reference_rows, "w", encoding="utf-8") as fh:
                 _, ref_catalog = collect_rows(reference, fh, text_field=text_field, context=self_context,
-                                              group_field=stratify_by)
+                                              group_field=stratify_by, language_guard=language_guard)
             with open(audited_rows, "w", encoding="utf-8") as fh:
                 profile, catalog = collect_rows(path, fh, text_field=text_field, limit=limit,
                                                 min_chars=min_chars, context=ref_context,
-                                                group_field=stratify_by)
+                                                group_field=stratify_by, language_guard=language_guard)
             catalog = dict(ref_catalog, **catalog)
             stats_source = reference_rows
         else:
             with open(audited_rows, "w", encoding="utf-8") as fh:
                 profile, catalog = collect_rows(path, fh, text_field=text_field, limit=limit,
-                                                min_chars=min_chars, group_field=stratify_by)
+                                                min_chars=min_chars, group_field=stratify_by,
+                                                language_guard=language_guard)
             stats_source = audited_rows
 
         stats = build_reference_stats(_read_rows(stats_source), catalog, stratify=stratify_by is not None)
@@ -465,6 +497,9 @@ def score_corpus(
                 + "; groups under {0} documents use corpus-wide stats".format(50))
         dropped, coverage_note = coverage_drops(profile)
         notes.extend(profile.notes)
+        language_note = non_english_note(profile)
+        if language_note:
+            notes.append(language_note)
         if coverage_note:
             notes.append(coverage_note)
         reference_n = max((s.n for k, s in stats.items() if not isinstance(k, tuple)), default=0)
@@ -473,6 +508,13 @@ def score_corpus(
                 "only {0} scoreable documents in the normalisation reference: corpus-relative "
                 "z-scores rest on a tiny sample. Treat tiers as illustrative, or pass --reference "
                 "with a larger trusted corpus.".format(reference_n))
+        cal_strat = calibration.meta.get("stratify_by")
+        if cal_strat != stratify_by:
+            notes.append(
+                "the calibration was built {0} but this run is {1}: its thresholds assume the "
+                "same normalisation, so tier rates will not match its held-out figures".format(
+                    "with --stratify-by {0}".format(cal_strat) if cal_strat else "without --stratify-by",
+                    "stratified by {0}".format(stratify_by) if stratify_by else "unstratified"))
         unknown = sorted(n for n, info in catalog.items()
                          if info.family == "artifact" and n not in calibration.human.counts)
         if unknown:

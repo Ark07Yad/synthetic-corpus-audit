@@ -40,7 +40,7 @@ _TIER_BLURB = {
     "LIKELY_SYNTHETIC": "two or more families are atypical beyond their calibrated thresholds",
     "SUSPECT": "exactly one family is atypical beyond its threshold",
     "CLEAN": "no family exceeds its threshold",
-    "UNSCORED": "too short to analyse (under 50 words)",
+    "UNSCORED": "not analysed: under 50 words, or evidently not English",
 }
 
 

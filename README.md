@@ -6,7 +6,7 @@ Find AI-generated text in a pre-training corpus *before* it poisons your tokeniz
 
 [![ci](https://github.com/Ark07Yad/synthetic-corpus-audit/actions/workflows/ci.yml/badge.svg)](https://github.com/Ark07Yad/synthetic-corpus-audit/actions/workflows/ci.yml)
 ![python](https://img.shields.io/badge/python-3.9%2B-blue)
-![tests](https://img.shields.io/badge/tests-212-brightgreen)
+![tests](https://img.shields.io/badge/tests-254-brightgreen)
 ![dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)
 ![status](https://img.shields.io/badge/status-evaluated-blue)
 
@@ -35,14 +35,16 @@ the same kind (full report: [`benchmarks/EVALUATION.md`](benchmarks/EVALUATION.m
 
 | Model-written text | Flagged | False positives (human) | AUC |
 |---|---|---|---|
-| Older open-weight models: BLOOM, GPT-J/NeoX, FLAN-T5, OPT, GLM (MAGE) | **84–100%** | 18–22% flagged, ~2% `LIKELY` | 0.92–0.99 |
+| Older open-weight models: BLOOM, GPT-J/NeoX, FLAN-T5, OPT, GLM (MAGE) | **84–100%** | 18–21% flagged, ~2% `LIKELY` | 0.92–0.99 |
 | LLaMA-1, 7–65B (MAGE) | 65–68% | same | 0.88 |
 | OpenAI GPT-3.5 / davinci / GPT-4 (MAGE) | **30–40%** | same | 0.61–0.64 |
 | Claude, technical documentation (blind-written) | **19%** | 9% | 0.78 |
 
 These figures are for the recommended mode, `--reference` with a genre-matched human
-corpus. On 1,442 MAGE documents held back from every analysis: **AUC 0.87**, 72.8%
-flagged at an 18.1% false-positive rate, 42.2% `LIKELY_SYNTHETIC` at 2.3%.
+corpus. On 1,440 MAGE documents held back from every analysis: **AUC 0.87**, 72.9%
+flagged at a 17.7% false-positive rate, 42.4% `LIKELY_SYNTHETIC` at 1.8%. **Calibrated
+on matched human text with `chaff calibrate`, the false-positive rate drops to 7.3% while
+76.0% is flagged.**
 
 **What that means.** chaff is a useful triage tool for contamination by older and
 open-weight models and for heavily templated synthetic text. It is **not** a reliable
@@ -92,6 +94,10 @@ chaff report scores.jsonl --format md                                # re-render
 chaff score crawl.jsonl --reference trusted.jsonl --out scores.jsonl # normalise against a trusted corpus (recommended)
 chaff score crawl.jsonl --stratify-by domain --out scores.jsonl      # normalise within each value of a record field
 
+chaff calibrate trusted.jsonl --out mine.json   # thresholds from a trusted human corpus of your own genre
+chaff score crawl.jsonl --reference trusted.jsonl --calibration mine.json
+chaff dedup crawl.jsonl --out clusters.jsonl    # near-duplicate clusters: template floods
+
 chaff profile corpus.jsonl --out rows.jsonl  # raw signals per document, no scoring
 chaff inspect corpus.jsonl -n 5              # see individual docs as chaff sees them
 chaff families                               # what is implemented
@@ -113,6 +119,33 @@ is skipped there, with a note saying so, unless `--reference` supplies the model
 Reads `.jsonl`, `.jsonl.gz`, `.ndjson`, plain text files, directories, or stdin.
 The text field is autodetected across Common Crawl / C4 / RedPajama / Pile conventions,
 or set it with `--text-field`.
+
+## Using it on your own corpus
+
+Three tools for turning a general instrument into one tuned to your data:
+
+**`chaff calibrate`: thresholds from your genre.** The shipped calibration was fit on
+technical reference text, and false-positive rates don't transfer between genres. Give
+`calibrate` a trusted human corpus of your own genre (200 documents minimum; it warns
+below 1,000, and more is better still). It fits on half of it, reports the held-out rate on the other half, and writes
+a file for `chaff score --calibration`. On MAGE's held-back documents, calibrating on
+matched human text cut false flags from 17.7% to 7.3% while flagging *more* synthetic
+text (72.9% → 76.0%). It refuses a corpus too small to calibrate on, and warns when the
+held-out rate overshoots the target.
+
+**`chaff dedup`: template floods.** Per-document scores can't see a pipeline that produced
+5,000 near-identical articles from one prompt: each one looks fine alone. `dedup`
+clusters near-duplicates (estimated Jaccard ≥ 0.8 on word 5-grams, by MinHash and LSH)
+and writes each document's cluster. 100k documents take 17 seconds; a flood of 5,000
+copies costs ~5,000 comparisons, not 12 million.
+
+**Language guard.** Every reference distribution chaff ships is English, so a German page
+scored against them gets a confident, meaningless score. Documents with positive evidence
+of another language (mostly non-Latin script, or another language's function words
+outnumbering English ones) are now `UNSCORED` with the reason in `scores.jsonl` and
+`chaff explain`. On 7,478 English documents it flagged none; on ~1,400 localized macOS
+help and licence files in 40+ languages it caught 98.7%. It also found a French review and
+a Welsh news story inside MAGE's "English" human text. `--allow-non-english` turns it off.
 
 ## What it measures
 
@@ -233,6 +266,7 @@ MAGE. The level of surprisal did better where synthetic and human text share a d
 | 4 | Artifact + reasoning families, false-positive benchmark on guaranteed-human text | **done** |
 | 5 | Fusion: length-stratified normalisation, calibrated tiers, Fisher score, `score` / `explain` / `report` | **done** |
 | 6 | Evaluation on real model output (MAGE, 25 generators; blind Claude), two-sided scoring, `--stratify-by`, 100k-document scale run | **done** |
+| 7 | Usable on your own corpus: `chaff calibrate`, `chaff dedup`, language guard | **done** |
 
 **Scale:** 100,000 documents (~25M tokens) scored end to end in 5.1 minutes at 2.2 GB peak
 memory, single-threaded, two passes over the corpus.
@@ -248,7 +282,14 @@ true-positive behaviour on MAGE and on blind Claude-written text
   Claude-written technical docs are flagged. Don't use chaff as your only filter against
   modern-model contamination.
 - **False positives depend on genre.** From 11% flagged (reference prose) to 38%
-  (science abstracts). Calibrate on a trusted human corpus of your own genre.
+  (science abstracts). Run `chaff calibrate` on a trusted human corpus of your own genre.
+- **English only.** Documents that are evidently in another language are `UNSCORED`
+  with a reason rather than scored against English baselines. The guard misses
+  languages it has no word list for (Lithuanian, for one) and some short Polish,
+  Slovenian and Finnish pages.
+- **Small calibrations are noisy.** With ~1,500 trusted documents, one document can move
+  the chosen threshold a step. `chaff calibrate` reports the held-out rate and warns when
+  it overshoots the target. Several thousand trusted documents make it stable.
 - **Two-sided scoring has a cost.** Unusually *rich* human writing, such as a casual post
   where every sentence brings new content, can be flagged `SUSPECT` when compared against
   formal text.
@@ -267,6 +308,9 @@ true-positive behaviour on MAGE and on blind Claude-written text
 - **Not for academic integrity.** Wrong granularity, and the false-positive cost falls on
   a person rather than on a row in a dataset. Please do not use it that way.
 - Single-document scores are noisy below ~50 words and are reported, not scored.
+- **Near-copies right at the dedup threshold are found only some of the time.** The
+  similarity is an estimate (±0.05 around 0.8), so pairs that sit at the cutoff fall
+  either side of it. Pairs comfortably above it are found reliably.
 - **Changelogs and licence boilerplate are the characteristic human false positives.**
   7 of 9 licence texts are `SUSPECT`, and the top human false positives are release
   notes. The corroboration rule keeps them out of `LIKELY_SYNTHETIC`, not out of
@@ -290,7 +334,7 @@ true-positive behaviour on MAGE and on blind Claude-written text
 |---|---|
 | `src/chaff/` | The package |
 | `src/chaff/metrics/` | The `Signal` contract and the metric families |
-| `tests/` | 212 tests |
+| `tests/` | 254 tests |
 | [`benchmarks/EVALUATION.md`](benchmarks/EVALUATION.md) | true-positive evaluation: MAGE, blind Claude, contamination sweep, failure cases |
 | [`benchmarks/`](benchmarks/) | false-positive benchmark on guaranteed-human text |
 | [`data/samples/`](data/samples/) | 10 labelled documents, including deliberate hard cases |
